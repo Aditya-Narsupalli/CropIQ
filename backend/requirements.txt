@@ -1,0 +1,46 @@
+# FarmGenius Backend Requirements
+# Install with: pip install -r requirements.txt
+
+# --- Core Web Framework ---
+fastapi>=0.110.0,<0.112.0         # Robust, modern web API framework
+uvicorn[standard]>=0.29.0,<0.31.0 # ASGI server for FastAPI
+
+# --- Environment & Config ---
+python-dotenv>=1.0.0,<2.0.0       # .env file support
+
+# --- AI & ML Integrations ---
+google-genai>=1.0.0  # Gemini API client (new SDK)
+# groq  # (Removed: No longer used)
+
+# --- Data & Image Processing ---
+Pillow>=10.0.0,<11.0.0             # Image handling
+python-multipart>=0.0.9            # File uploads for FastAPI
+numpy>=1.24.0,<2.0.0               # Numerical operations for yield prediction
+pandas
+xgboost
+
+# --- HTTP & Scraping ---
+httpx>=0.27.0,<0.28.0              # Async HTTP client for scraping
+beautifulsoup4>=4.12.0,<5.0.0      # HTML parsing for market data
+requests>=2.31.0,<3.0.0            # Sync HTTP client for weather/geocoding APIs
+
+# --- Data Validation ---
+pydantic>=2.0.0,<3.0.0             # Data validation and parsing
+
+# --- Utilities ---
+python-dateutil>=2.8.0,<3.0.0      # Date parsing for market data
+
+# --- Testing ---
+pytest>=7.0.0,<8.0.0               # For backend tests
+
+# --- Text-to-Speech ---
+google-cloud-texttospeech>=2.16.0,<3.0.0   # For TTS endpoint
+gTTS>=2.5.1,<3.0.0                    # For simple TTS (used in /text-to-speech)
+SpeechRecognition>=3.10.0,<4.0.0       # For speech-to-text (used in /speech-to-text)
+PyAudio>=0.2.14,<0.3.0                 # Audio support for SpeechRecognition
+google-cloud-speech
+
+# --- Optional: Better logging ---
+# rich>=13.0.0,<14.0.0             # (Optional) Pretty logging and tracebacks
+
+# (All dependencies are required for hackathon features. Remove/comment out anything not used.)
