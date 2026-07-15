@@ -1,9 +1,10 @@
-﻿"use client"
+"use client"
 
 import { useCallback, useState } from "react"
 import { Leaf, Droplet, Map, EarthIcon as Soil, Thermometer, Tractor, Coins, Users } from "lucide-react"
 import { FaMapMarkerAlt, FaSearchLocation, FaSpinner } from "react-icons/fa"
 import LocationMapPicker from "../../components/LocationMapPicker"
+import { API_BASE_URL } from "../../services/api"
 
 export default function Microfarm() {
   const [formData, setFormData] = useState({
@@ -186,13 +187,18 @@ export default function Microfarm() {
     }
 
     try {
-      const res = await fetch("http://localhost:8000/api/v1/microfarm/recommend", {
+      const res = await fetch(`${API_BASE_URL}/microfarm/recommend`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       })
+
+      if (!res.ok) {
+        const errorBody = await res.json().catch(() => null)
+        throw new Error(errorBody?.message || errorBody?.detail || `Request failed with status ${res.status}`)
+      }
+
       const data = await res.json()
-      setLoading(false)
 
       if (data.success && data.recommendations.length > 0) {
         setMessage(data.message || "Here are your recommendations:")
@@ -201,9 +207,10 @@ export default function Microfarm() {
         setMessage(data.message || "No suitable systems found for your inputs.")
       }
     } catch (err) {
-      console.error(err)
+      console.error("Failed to fetch recommendations:", err)
+      setError(err.message || "Failed to fetch recommendations. Please try again.")
+    } finally {
       setLoading(false)
-      setError("Failed to fetch recommendations. Please try again.")
     }
   }
 
