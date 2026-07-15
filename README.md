@@ -84,7 +84,7 @@ flowchart TD
         MarketUI[Market Predictor UI]
         YieldUI[Yield Predictor UI]
         DiseaseUI[Disease Diagnosis UI]
-        MapComp[Google Maps Integration]
+        MapComp[OpenStreetMaps]
         WeatherComp[Weather API Integration]
     end
 
@@ -102,7 +102,7 @@ flowchart TD
     end
 
     subgraph External
-        GoogleMaps[Google Maps API]
+        OpenStreetMaps
         OpenWeather[OpenWeather API]
         AgMarkNet[AgMarkNet Portal]
         Gemini[Gemini LLM]
@@ -113,7 +113,7 @@ flowchart TD
     MarketUI -->|REST| MarketEP
     YieldUI -->|REST| YieldEP
     DiseaseUI -->|REST| DiseaseEP
-    MapComp --> GoogleMaps
+    MapComp --> OpenStreetMaps
     WeatherComp --> OpenWeather
 
     MarketEP --> Scraper
@@ -172,7 +172,6 @@ OPENWEATHER_API_KEY=your_openweather_api_key
 
 ```env
 VITE_API_URL=http://localhost:8000
-VITE_GOOGLE_MAPS_API_KEY=your_google_maps_api_key
 ```
 
 ### Backend
