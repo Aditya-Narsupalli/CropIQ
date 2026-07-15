@@ -18,7 +18,7 @@ CropIQ is an advanced, multi-agent agricultural assistant designed for Indian fa
 ## ✨ Features
 - **Multi-Agent Chat**: Conversational assistant with intent routing and context memory
 - **Market Data**: AgMarkNet scraping, static fallback, and forecasting
-- **Yield Prediction**: Google Maps farm selection, OpenWeather integration, ML models
+- **Yield Prediction**: Maps farm selection, OpenWeather integration, ML models
 - **Disease Detection**: Deep learning or Gemini Vision analysis of crop images
 - **Nationwide Coverage**: All major crops, markets, and Indian states
 - **Modern UI**: Shareable conversations, streaming responses, mobile-first
@@ -37,7 +37,7 @@ CropIQ is an advanced, multi-agent agricultural assistant designed for Indian fa
 **Frontend:**
 - React (Vite)
 - Modular feature structure
-- Google Maps JS API, OpenWeather API
+- OpenStreetMaps, OpenWeather API
 - Modern CSS Modules, context/hooks
 
 ---
