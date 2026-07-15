@@ -4,6 +4,13 @@
 
 ---
 
+## 🌐 Live Demo
+
+Frontend: https://crop-iq-azure.vercel.app
+
+Backend API: https://cropiq-1ijh.onrender.com
+
+
 ## 🚀 Overview
 CropIQ is an advanced, multi-agent agricultural assistant designed for Indian farmers, agri-entrepreneurs, and researchers. It combines AI-driven chat, real-time yield prediction, market price forecasting, and disease diagnosis in a unified, modern platform.
 
@@ -158,6 +165,11 @@ flowchart TD
 
 ## ⚡ Setup & Installation
 
+### Clone 
+ 
+```bash
+git clone https://github.com/Aditya-Narsupalli/CropIQ.git
+```
 
 Before running the project, create `.env` files in the `backend` and `frontend` directories using the provided `.env.example` files.
 
