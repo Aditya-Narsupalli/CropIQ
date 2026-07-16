@@ -191,7 +191,10 @@ class MarketAnalyzerAgent(Agent):
             location = message.content.get("location", "Baramati")
             force_refresh = message.content.get("force_refresh", False)
             
-            # Get live prices using the scraper
+            # Get live prices using the scraper (real Agmarknet data).
+            # Note: Agmarknet's dashboard-data API returns a national
+            # summary per commodity, not per-district, so `location` is
+            # currently informational only and doesn't narrow the result.
             if crop:
                 # Get specific crop prices
                 scraper = get_scraper("agmarknet")
