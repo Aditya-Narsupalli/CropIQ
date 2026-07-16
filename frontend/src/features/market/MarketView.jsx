@@ -47,9 +47,14 @@ const MarketView = () => {
         const pricesJson = await getMarketPricesApi();
         setMarketData(pricesJson.market_data || []);
 
+        // price_change_pct now comes from the live Agmarknet API
+        // (today's price vs. yesterday's), no more random mock values.
         const changes = {};
         pricesJson.market_data.forEach((item) => {
-          changes[item.crop] = Math.floor(Math.random() * 21) - 10;
+          changes[item.crop] =
+            item.price_change_pct !== undefined && item.price_change_pct !== null
+              ? item.price_change_pct
+              : 0;
         });
         setPriceChangeData(changes);
 
