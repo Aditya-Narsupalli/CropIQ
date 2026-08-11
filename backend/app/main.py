@@ -7,6 +7,8 @@ import asyncio
 from app.core.multi_agent import coordinator, context_protocol
 from app.core.agents import init_agents
 from app.core.chat_agent import init_chat_agent
+from app.core.db import init_db
+from app.core.scheduler import start_price_collection_task
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -68,6 +70,18 @@ async def startup_event():
 
     print(f"CORS allowed origins: {origins}")
 
+    # Initialize the PostgreSQL market price history table.
+    print("Initializing market price history database...")
+    try:
+        await init_db()
+        # Kick off the background job that takes a daily snapshot of live
+        # commodity prices (Agmarknet only exposes "today") and purges rows
+        # older than the 30-day retention window.
+        app.state.price_collection_task = start_price_collection_task()
+        print("Market price history database ready; daily price collection scheduled.")
+    except Exception as e:
+        print(f"STARTUP WARNING: Could not initialize market price database: {e}")
+
     # Initialize multi-agent system
     print("Initializing multi-agent system...")
     coord = init_agents()
@@ -89,6 +103,9 @@ async def startup_event():
         },
     )
 
-# @app.on_event("shutdown")
-# async def shutdown_event():
-#     print("Shutting down CropIQ API...")
+@app.on_event("shutdown")
+async def shutdown_event():
+    print("Shutting down CropIQ API...")
+    task = getattr(app.state, "price_collection_task", None)
+    if task:
+        task.cancel()

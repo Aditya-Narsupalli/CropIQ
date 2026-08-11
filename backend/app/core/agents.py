@@ -8,8 +8,7 @@ import logging
 import json
 import io
 from PIL import Image
-from datetime import datetime, timedelta
-import random
+
 
 from app.core.multi_agent import Agent, AgentType, Message, coordinator, context_protocol
 from app.core.ai_services import (
@@ -20,6 +19,11 @@ from app.core.ai_services import (
     generate_text,
 )
 from app.services.market_scraper import get_all_prices, get_scraper
+from app.services.market_history_service import (
+    get_historical_prices,
+    purge_expired_prices,
+    save_daily_prices,
+)
 from app.core.config import get_settings
 
 # Initialize settings
@@ -206,6 +210,13 @@ class MarketAnalyzerAgent(Agent):
                     self.last_update = asyncio.get_event_loop().time()
                     
                 prices = self.cached_prices
+
+            # Persist today's snapshot into Postgres so it becomes part of
+            # the rolling 30-day history used for the price trend charts,
+            # then drop anything older than the retention window.
+            if prices:
+                await save_daily_prices(prices)
+                await purge_expired_prices()
             
             # Store the result in context if session_id is provided
             context_id = message.context.get("session_id") if message.context else None
@@ -236,36 +247,39 @@ class MarketAnalyzerAgent(Agent):
             )
     
     async def handle_analyze_trends(self, message: Message) -> Optional[Message]:
-        """Analyze market trends for specific crops (Simulated)"""
+        """Analyze market trends for a specific crop using real daily prices
+        accumulated in Postgres (up to the last 30 days)."""
+        crop = message.content.get("crop", "unknown crop")
         try:
-            crop = message.content.get("crop", "unknown crop")
-            logger.info(f"Generating simulated trend analysis for: {crop}")
+            logger.info(f"Building trend analysis for: {crop} from stored price history")
 
-            # Simulate fetching historical data (replace with real data later)
-            # Generate some plausible fake historical prices for the last 30 days
-            today = datetime.now()
-            historical_prices = []
-            base_price = random.randint(1500, 5000) # Base price for the crop
-            for i in range(30, 0, -1):
-                date = (today - timedelta(days=i)).strftime("%Y-%m-%d")
-                # Simulate price fluctuation around the base price with a slight upward trend
-                price_fluctuation = random.uniform(-0.05, 0.07) # +/- 5-7% fluctuation
-                price = base_price * (1 + price_fluctuation + (0.001 * (30-i))) # Slight upward trend factor
-                price = round(price, 2)
-                historical_prices.append({"date": date, "price": price})
-                base_price = price # Next day's price starts from previous day
+            # Make sure we have at least today's price on record before
+            # reading history back, in case the background collector
+            # hasn't run yet for this crop.
+            scraper = get_scraper("agmarknet")
+            todays_prices = await scraper.get_prices(crop)
+            if todays_prices:
+                await save_daily_prices(todays_prices)
+            await purge_expired_prices()
 
-            # Generate a simple trend summary based on simulated data
-            start_price = historical_prices[0]["price"]
-            end_price = historical_prices[-1]["price"]
-            trend_percentage = ((end_price - start_price) / start_price) * 100
-            
-            if trend_percentage > 5:
-                trend_summary = f"Prices for {crop} have shown a noticeable upward trend over the past month (approx. {trend_percentage:.1f}% increase)."
-            elif trend_percentage < -5:
-                trend_summary = f"Prices for {crop} have shown a noticeable downward trend over the past month (approx. {trend_percentage:.1f}% decrease)."
+            historical_prices = await get_historical_prices(crop)
+
+            if len(historical_prices) < 2:
+                trend_summary = (
+                    f"Not enough price history for {crop} yet - we only just started tracking it. "
+                    f"Check back after a few days as daily prices accumulate to see a trend."
+                )
             else:
-                trend_summary = f"Prices for {crop} have remained relatively stable over the past month (change of {trend_percentage:.1f}%)."
+                start_price = historical_prices[0]["price"]
+                end_price = historical_prices[-1]["price"]
+                trend_percentage = ((end_price - start_price) / start_price) * 100 if start_price else 0
+
+                if trend_percentage > 5:
+                    trend_summary = f"Prices for {crop} have shown a noticeable upward trend over the recorded period (approx. {trend_percentage:.1f}% increase)."
+                elif trend_percentage < -5:
+                    trend_summary = f"Prices for {crop} have shown a noticeable downward trend over the recorded period (approx. {trend_percentage:.1f}% decrease)."
+                else:
+                    trend_summary = f"Prices for {crop} have remained relatively stable over the recorded period (change of {trend_percentage:.1f}%)."
 
             # Store result in context if needed
             context_id = message.context.get("session_id") if message.context else None
@@ -273,7 +287,7 @@ class MarketAnalyzerAgent(Agent):
                 context_protocol.update_context(context_id, {
                     f"trend_analysis_{crop}": {
                         "summary": trend_summary,
-                        "historical_data": historical_prices # Include historical data for potential future use (e.g., charting)
+                        "historical_data": historical_prices
                     }
                 })
 
@@ -281,15 +295,15 @@ class MarketAnalyzerAgent(Agent):
                 sender=self.agent_type,
                 receiver=message.sender,
                 content={
-                    "message": trend_summary, 
-                    "historical_data": historical_prices # Optionally return historical data too
+                    "message": trend_summary,
+                    "historical_data": historical_prices  # real data from market_price_history (<=30 days)
                 },
                 message_type="trend_analysis_result",
                 context=message.context
             )
 
         except Exception as e:
-            logger.error(f"Error generating simulated trends for {crop}: {e}")
+            logger.error(f"Error analyzing trends for {crop}: {e}")
             return Message(
                 sender=self.agent_type,
                 receiver=message.sender,
