@@ -98,44 +98,14 @@ Be practical for Indian farmers. Use bullet points. If image is unclear, state t
         return f"Error analyzing image with Gemini: {str(e)}"
 
 
-# --- Yield Prediction Function ---
-async def get_yield_estimate(yield_input: 'YieldInput') -> str:
-    """
-    Generates a yield estimate using Gemini based on farmer's input.
-    """
-    if not gemini_client:
-        return "Error: Gemini text model is not configured."
-
-    try:
-        # Include regional context in the prompt
-        location_context = "Baramati, Maharashtra, India"
-        prompt = f"""Act as an agricultural assistant for a farmer in {location_context}.
-        Based on the following inputs:
-        - Crop: {yield_input.crop_type}
-        - Area: {yield_input.area}
-        - Region Details: {yield_input.region} (within {location_context})
-        - Soil Type: {yield_input.soil or 'Not specified'}
-        - Recent/Expected Weather: {yield_input.weather or 'Not specified'}
-
-        Provide a realistic estimated yield range (e.g., in quintals per acre or tonnes per hectare, specify the unit clearly).
-        Briefly explain the key factors (like weather, soil, crop type in this region) influencing this estimate in 2-3 short bullet points.
-        Keep the explanation simple and practical for a farmer.
-        Respond in English.
-        """
-
-        response = gemini_client.models.generate_content(
-            model=gemini_text_model_name,
-            contents=[prompt]
-        )
-
-        return getattr(response, "text", None) or (
-            response.candidates[0].content if getattr(response, 'candidates', None) else str(response)
-        )
-
-    except Exception as e:
-        print(f"Error in Gemini yield prediction: {e}")
-        # Consider more specific error handling based on potential Gemini exceptions
-        return f"Error generating yield estimate with Gemini: {str(e)}"
+# NOTE: A Gemini-based get_yield_estimate() used to live here. Removed -
+# it was unreachable (nothing ever actually dispatched a message to
+# YieldPredictorAgent, see the routing fix in agents.py::VoiceAssistantAgent)
+# and referenced YieldInput fields that don't exist (area_size). Yield
+# predictions now go through a single path everywhere - the trained ML
+# model in app/services/yield_prediction_service.py::predict_yield - used
+# by both the /predict REST endpoint and the chat/voice agents
+# (app/core/agents.py::YieldPredictorAgent).
 
 
 # --- Voice Command Processing Function ---

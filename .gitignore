@@ -1,0 +1,57 @@
+# ============================================
+# CropIQ - single root .gitignore (backend + frontend)
+# ============================================
+
+# --- Environment variables - never commit real credentials ---
+.env
+.env.local
+.env.*.local
+
+# --- Python (backend) ---
+venv/
+env/
+ENV/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# --- Node / frontend ---
+node_modules/
+dist/
+dist-ssr/
+*.local
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# --- Runtime-generated data - not source, shouldn't be committed. ---
+# Model files (yield_xgb_model.json, yield_model_meta.pkl, model.pkl,
+# model_meta.pkl) and static data (market_data.json, subsidies.json,
+# soil_ph_ranges.json) are intentionally NOT ignored - Render needs them
+# at deploy time since there's no build step that generates them.
+backend/app/data/price_snapshots.json
+
+# --- OS / editor files ---
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

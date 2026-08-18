@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Query
 from app.core.ai_services import get_market_summary_ai
 from app.services.market_scraper import get_all_prices, get_scraper
 from app.core.multi_agent import AgentType, Message, coordinator, context_protocol
@@ -117,8 +117,21 @@ async def add_market_listing(listing: MarketListing):
         print(f"Error creating market listing: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/trends/{crop}", status_code=200)
-async def get_market_trends(crop: str):
+@router.get("/trends/{crop}", status_code=200, deprecated=True)
+async def get_market_trends_path_param(crop: str):
+    """Deprecated: kept only for backward compatibility with any old
+    bookmarked/cached links. Real Agmarknet commodity names can contain a
+    literal '/' (e.g. "Bajra(Pearl Millet/Cumbu)") - even percent-encoded as
+    %2F, ASGI servers commonly decode that back to a literal '/' before
+    Starlette's router does path matching, so it gets split into extra path
+    segments and 404s. A crop name as a path segment can never be fully
+    safe for this reason; use GET /trends?crop=... instead (see below),
+    which has no such ambiguity for any character."""
+    return await get_market_trends(crop)
+
+
+@router.get("/trends", status_code=200)
+async def get_market_trends(crop: str = Query(..., description="Commodity name, e.g. 'Bajra(Pearl Millet/Cumbu)'")):
     """Analyze market trends for a specific crop."""
     try:
         # Create a session ID for context tracking

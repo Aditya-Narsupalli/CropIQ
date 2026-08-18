@@ -122,7 +122,13 @@ export const getMarketSummaryApi = async () => {
  */
 export const getMarketTrendsApi = async (crop) => {
   try {
-    const response = await apiClient.get(`/market/trends/${encodeURIComponent(crop)}`);
+    // Real Agmarknet commodity names can contain a literal '/' (e.g.
+    // "Bajra(Pearl Millet/Cumbu)"). Passing that as a URL PATH segment is
+    // unreliable even percent-encoded - many servers decode %2F back to a
+    // literal '/' before route matching, splitting the URL into extra
+    // segments and 404ing. A query parameter has no such ambiguity for any
+    // character, so that's used here instead of /market/trends/{crop}.
+    const response = await apiClient.get(`/market/trends`, { params: { crop } });
     return response.data;
   } catch (error) {
     if (error.response) {

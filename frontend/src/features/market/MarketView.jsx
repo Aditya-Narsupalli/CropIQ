@@ -18,8 +18,6 @@ import {
   FaChartLine,
   FaSearch,
   FaDownload,
-  FaInfoCircle,
-  FaRegCheckCircle,
   FaSpinner,
   FaTimes,
 } from "react-icons/fa";
@@ -33,6 +31,7 @@ const MarketView = () => {
   const [isFetchingCrop, setIsFetchingCrop] = useState(false);
   const [trendData, setTrendData] = useState("");
   const [historicalPriceData, setHistoricalPriceData] = useState([]);
+  const [trendSignal, setTrendSignal] = useState(null);
   const [sortDirection, setSortDirection] = useState("desc");
   const [filterValue, setFilterValue] = useState("");
   const [priceChangeData, setPriceChangeData] = useState({});
@@ -75,12 +74,21 @@ const MarketView = () => {
     setSelectedCrop(crop);
     setTrendData("");
     setHistoricalPriceData([]);
+    setTrendSignal(null);
 
     try {
       const data = await getMarketTrendsApi(crop);
       if (data && typeof data === "object") {
         setTrendData(data.message || "No trend summary available.");
         setHistoricalPriceData(data.historical_data || []);
+        if (data.confidence && data.confidence !== "none") {
+          setTrendSignal({
+            score: data.trend_score,
+            label: data.trend_label,
+            confidence: data.confidence,
+            advisory: data.advisory,
+          });
+        }
       } else {
         setTrendData("Error: Unexpected API response format.");
         setHistoricalPriceData([]);
@@ -203,6 +211,25 @@ const MarketView = () => {
           <p className="text-gray-600 max-w-xl md:max-w-2xl mx-auto text-sm md:text-base">
             {t("marketPriceDashboardDescription")}
           </p>
+          {!loading && marketData.length > 0 && (() => {
+            // Agmarknet itself has real reporting lag (its own website can
+            // show data that's a day or more old) - surface that plainly
+            // instead of implying these are always today's prices.
+            const latestDate = marketData.reduce(
+              (max, item) => (item.date > max ? item.date : max),
+              marketData[0]?.date || ""
+            );
+            if (!latestDate) return null;
+            const daysOld = Math.round(
+              (new Date().setHours(0, 0, 0, 0) - new Date(latestDate).setHours(0, 0, 0, 0)) / 86400000
+            );
+            if (daysOld <= 0) return null;
+            return (
+              <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-full inline-block px-3 py-1 mt-2">
+                Prices as of {latestDate} ({daysOld} day{daysOld > 1 ? "s" : ""} ago) - Agmarknet hasn't published newer data yet
+              </p>
+            );
+          })()}
         </div>
 
         {/* Main Content */}
@@ -546,11 +573,34 @@ const MarketView = () => {
                         <p className="text-gray-700">{trendData}</p>
                       )}
 
+                      {trendSignal && !isFetchingCrop && (
+                        <div className="mt-3 p-3 bg-white rounded-lg border border-gray-200">
+                          <div className="flex items-center gap-2 mb-2">
+                            <span
+                              className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
+                                trendSignal.label === "Upward"
+                                  ? "bg-green-100 text-green-700"
+                                  : trendSignal.label === "Downward"
+                                  ? "bg-red-100 text-red-700"
+                                  : "bg-gray-100 text-gray-700"
+                              }`}
+                            >
+                              {trendSignal.label} ({trendSignal.score > 0 ? "+" : ""}
+                              {trendSignal.score}%)
+                            </span>
+                            <span className="text-xs text-gray-500">
+                              Confidence: {trendSignal.confidence}
+                            </span>
+                          </div>
+                          <p className="text-xs text-gray-600">{trendSignal.advisory}</p>
+                        </div>
+                      )}
+
                       {/* Historical Price Chart */}
                       {historicalPriceData.length > 0 && !isFetchingCrop && (
                         <div className="mt-4">
                           <h5 className="font-semibold text-blue-700 mb-2 text-sm">
-                            {t("priceTrendLast30Days")}
+                            Price Trend (Real Recorded Days)
                           </h5>
                           <div className="h-64">
                             <ResponsiveContainer width="100%" height="100%">
@@ -593,56 +643,18 @@ const MarketView = () => {
                         </div>
                       )}
 
-                      {/* Price Prediction Section */}
-                      {historicalPriceData.length > 0 && !isFetchingCrop && (
-                        <div className="mt-4 pt-4 border-t border-blue-200">
-                          <h5 className="font-semibold text-blue-700 mb-2 text-sm">
-                            {t("marketIntelligence")}
-                          </h5>
-                          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                            <div className="bg-white p-3 rounded-lg border border-blue-100 shadow-sm">
-                              <p className="text-sm font-medium text-blue-800">
-                                Projected Price (30 Days)
-                              </p>
-                              <p className="text-xl font-bold text-green-700 mt-1">
-                                ₹
-                                {(
-                                  Math.max(
-                                    ...historicalPriceData.map((d) => d.price)
-                                  ) *
-                                  (1 + (Math.random() * 0.12 - 0.05))
-                                ).toFixed(2)}
-                              </p>
-                              <p className="text-xs text-gray-500 mt-1">
-                                Projected using ML/AI trend analysis
-                              </p>
-                            </div>
-                            <div className="bg-white p-3 rounded-lg border border-blue-100 shadow-sm">
-                              <p className="text-sm font-medium text-blue-800">
-                                Best Time to Sell
-                              </p>
-                              <p className="text-xl font-bold text-blue-700 mt-1">
-                                {new Date(
-                                  Date.now() +
-                                    (Math.random() * 15 + 5) *
-                                      24 *
-                                      60 *
-                                      60 *
-                                      1000
-                                ).toLocaleDateString("en-IN", {
-                                  month: "short",
-                                  day: "numeric",
-                                })}
-                              </p>
-                              <p className="text-xs text-gray-500 mt-1">
-                                Based on seasonal trends
-                              </p>
-                            </div>
-                          </div>
-                        </div>
-                      )}
-
-                      {/* Market Alerts */}
+                      {/* Market Alerts - uses the REAL day-over-day change
+                          from priceChangeData (populated from Agmarknet's
+                          own price_change_pct). Previously this looked up
+                          `selectedCrop + " (Maharashtra)"`, a key that never
+                          existed in priceChangeData (which is keyed by plain
+                          crop name) - so the lookup always failed and fell
+                          back to a hardcoded "5%", shown as if real, for
+                          every single crop regardless of actual data. Also
+                          mislabeled a day-over-day figure as "in the last
+                          week". Fixed to use the correct key, the accurate
+                          timeframe, and to say so honestly when there's no
+                          real change data instead of fabricating one. */}
                       {selectedCrop && !isFetchingCrop && (
                         <div className="mt-4 pt-4 border-t border-blue-200">
                           <div className="flex justify-between items-center mb-2">
@@ -653,75 +665,58 @@ const MarketView = () => {
                               {t("setPriceAlert")}
                             </button>
                           </div>
-                          <div className="bg-yellow-50 border-l-4 border-yellow-400 p-3 rounded">
-                            <p className="text-sm text-yellow-800">
-                              Price for <strong>{selectedCrop}</strong> has
-                              fluctuated by{" "}
-                              {Math.abs(
-                                priceChangeData[
-                                  selectedCrop + " (Maharashtra)"
-                                ] || 5
-                              )}
-                              % in the last week.
-                            </p>
-                          </div>
+                          {(() => {
+                            // Primary source: today's live Agmarknet fetch.
+                            // Fallback: compute a real day-over-day change
+                            // from the last two points of the historical
+                            // store we already loaded for the chart - Agmarknet
+                            // not including a crop in *today's* live snapshot
+                            // doesn't mean we have no real recent data for it,
+                            // we might just need to look at our own recorded
+                            // history instead of only today's live fetch.
+                            let pct = priceChangeData[selectedCrop];
+                            let source = "today's live Agmarknet data";
+                            if ((pct === undefined || pct === null || pct === 0) && historicalPriceData.length >= 2) {
+                              const prev = historicalPriceData[historicalPriceData.length - 2].price;
+                              const curr = historicalPriceData[historicalPriceData.length - 1].price;
+                              if (prev) {
+                                pct = Math.round(((curr - prev) / prev) * 1000) / 10;
+                                source = "our recorded price history";
+                              }
+                            }
+                            if (pct !== undefined && pct !== null && pct !== 0) {
+                              return (
+                                <div className="bg-yellow-50 border-l-4 border-yellow-400 p-3 rounded">
+                                  <p className="text-sm text-yellow-800">
+                                    Price for <strong>{selectedCrop}</strong> has{" "}
+                                    {pct > 0 ? "risen" : "fallen"}{" "}
+                                    {Math.abs(pct)}% since yesterday (based on {source}).
+                                  </p>
+                                </div>
+                              );
+                            }
+                            return (
+                              <p className="text-sm text-gray-500">
+                                No real day-over-day change data available for {selectedCrop} right now.
+                              </p>
+                            );
+                          })()}
                         </div>
                       )}
                     </div>
                   )}
                 </div>
 
-                {/* Market Recommendation Card */}
-                <div className="bg-white p-6 rounded-lg shadow-sm border border-amber-100">
-                  <h3 className="font-semibold text-lg text-gray-800 mb-4 flex items-center">
-                    <GiWheat className="mr-2 text-amber-600" />
-                    Market Recommendations
-                  </h3>
-                  <div className="space-y-3">
-                    <div className="flex items-center p-3 border border-green-100 rounded-lg shadow-sm bg-green-50">
-                      <div className="bg-green-100 rounded-full p-2 mr-3">
-                        <FaRegCheckCircle className="text-green-700" />
-                      </div>
-                      <div>
-                        <h4 className="font-medium text-green-800">
-                          Best Market Performer
-                        </h4>
-                        <p className="text-sm text-gray-600">
-                          Soybean is showing consistent price growth in
-                          Maharashtra markets.
-                        </p>
-                      </div>
-                    </div>
-                    <div className="flex items-center p-3 border border-blue-100 rounded-lg shadow-sm bg-blue-50">
-                      <div className="bg-blue-100 rounded-full p-2 mr-3">
-                        <FaChartLine className="text-blue-700" />
-                      </div>
-                      <div>
-                        <h4 className="font-medium text-blue-800">
-                          Rising Demand
-                        </h4>
-                        <p className="text-sm text-gray-600">
-                          Turmeric prices are expected to rise due to increased
-                          export demand.
-                        </p>
-                      </div>
-                    </div>
-                    <div className="flex items-center p-3 border border-purple-100 rounded-lg shadow-sm bg-purple-50">
-                      <div className="bg-purple-100 rounded-full p-2 mr-3">
-                        <FaInfoCircle className="text-purple-700" />
-                      </div>
-                      <div>
-                        <h4 className="font-medium text-purple-800">
-                          Seasonal Insight
-                        </h4>
-                        <p className="text-sm text-gray-600">
-                          Now is the optimal time to plan for rabi crops
-                          according to market trends.
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-                </div>
+                {/* Market Recommendations card removed - it was entirely
+                    static text ("Soybean is showing consistent price growth
+                    in Maharashtra markets", "Turmeric prices are expected to
+                    rise due to increased export demand", etc.), shown
+                    identically regardless of any real data, date, or actual
+                    crop performance. A genuine version of this would need to
+                    compare analyze_trend_signal's real trend_score across
+                    all crops to find an actual best/worst performer - worth
+                    building properly later, but not worth faking in the
+                    meantime. */}
               </div>
             </div>
           )}

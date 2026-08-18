@@ -23,14 +23,16 @@ async def predict_farm_yield(
             weather_data = get_weather_data(yield_input.latitude, yield_input.longitude)
         
         # Call the prediction service
-        yield_per_hectare, total_production, recommendations = predict_yield(yield_input)
+        yield_per_hectare, total_production, recommendations, model_source, model_r2 = predict_yield(yield_input)
         
         # Create response - explicitly use the field name (yield_) instead of the alias (yield)
         response_data = {
             "success": True,
             "yield_": yield_per_hectare,  # Use the field name, not the alias
             "estimated_production": total_production,
-            "recommendations": recommendations
+            "recommendations": recommendations,
+            "model_source": model_source,
+            "model_r2": model_r2,
         }
         
         # Add weather data to response if available

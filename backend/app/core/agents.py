@@ -14,12 +14,13 @@ import random
 from app.core.multi_agent import Agent, AgentType, Message, coordinator, context_protocol
 from app.core.ai_services import (
     get_disease_prediction, 
-    get_yield_estimate, 
     process_voice_command_ai, 
     get_market_summary_ai,
     generate_text,
 )
-from app.services.market_scraper import get_all_prices, get_scraper
+from app.models.yield_model import YieldInput
+from app.services.yield_prediction_service import predict_yield
+from app.services.market_scraper import get_all_prices, get_scraper, record_todays_snapshot_if_needed, get_local_price_history
 from app.core.config import get_settings
 
 # Initialize settings
@@ -122,8 +123,18 @@ class DiseaseDetectorAgent(Agent):
             )
 
 class YieldPredictorAgent(Agent):
-    """Agent specializing in crop yield predictions"""
-    
+    """Agent specializing in crop yield predictions.
+
+    Wired to the same trained ML model used by the /predict REST endpoint
+    (app/services/yield_prediction_service.py::predict_yield), so the chat
+    assistant and the yield prediction form give consistent answers instead
+    of two independently-drifting implementations. There used to be a
+    second, Gemini-based estimate here (ai_services.py::get_yield_estimate) -
+    it's been removed: it was never actually reachable (see the routing note
+    in VoiceAssistantAgent below) and referenced fields that don't exist on
+    YieldInput (yield_input.area_size).
+    """
+
     def __init__(self):
         super().__init__(AgentType.YIELD_PREDICTOR)
         self.register_handler("predict_yield", self.handle_predict_yield)
@@ -131,34 +142,60 @@ class YieldPredictorAgent(Agent):
     async def handle_predict_yield(self, message: Message) -> Optional[Message]:
         """Generate yield prediction from farmer input"""
         try:
-            # The content should contain the YieldInput model data
-            yield_input = message.content.get("yield_input")
-            if not yield_input:
+            # content["yield_input"] can be a YieldInput instance or a plain
+            # dict (e.g. built from partial info extracted in chat) - accept
+            # either, filling in required-but-unknown fields with neutral
+            # defaults rather than failing the whole request.
+            raw_input = message.content.get("yield_input")
+            if not raw_input:
                 return Message(
                     sender=self.agent_type,
                     receiver=message.sender,
                     content={"error": "No yield input data provided"},
                     message_type="error"
                 )
-                
-            # Call AI service for yield prediction
-            result = await get_yield_estimate(yield_input)
-            
+
+            if isinstance(raw_input, YieldInput):
+                yield_input = raw_input
+            else:
+                defaults = dict(
+                    area=1.0, season="Kharif", state="Maharashtra", annual_rainfall=800.0,
+                    fertilizer=100.0, pesticide=3.0, ph=6.5, n=120.0, p=50.0, k=100.0,
+                    organic_carbon=0.5,
+                )
+                defaults.update(raw_input)
+                yield_input = YieldInput(**defaults)
+
+            yield_per_hectare, total_production, recommendations, model_source, model_r2 = predict_yield(yield_input)
+            result = (
+                f"Estimated yield for {yield_input.crop} in {yield_input.state} ({yield_input.season}): "
+                f"{yield_per_hectare:.2f} tonnes/hectare, ~{total_production:.2f} tonnes total "
+                f"over {yield_input.area} hectares. "
+                f"{'(Backed by our trained yield model.)' if model_source == 'ml' else '(Estimated using a simplified model - limited historical data for this crop.)'}"
+            )
+
             # Store the result in context if session_id is provided
             context_id = message.context.get("session_id") if message.context else None
             if context_id:
                 context_protocol.update_context(context_id, {
                     "last_yield_prediction": {
-                        "crop": yield_input.crop_type,
-                        "area": yield_input.area_size,
-                        "prediction": result
+                        "crop": yield_input.crop,
+                        "area": yield_input.area,
+                        "prediction": result,
+                        "model_source": model_source,
                     }
                 })
             
             return Message(
                 sender=self.agent_type,
                 receiver=message.sender,
-                content={"result": result},
+                content={
+                    "result": result,
+                    "yield_per_hectare": yield_per_hectare,
+                    "estimated_production": total_production,
+                    "recommendations": recommendations,
+                    "model_source": model_source,
+                },
                 message_type="prediction_result",
                 context=message.context
             )
@@ -236,36 +273,78 @@ class MarketAnalyzerAgent(Agent):
             )
     
     async def handle_analyze_trends(self, message: Message) -> Optional[Message]:
-        """Analyze market trends for specific crops (Simulated)"""
+        """Analyze market trends for a specific crop using real Agmarknet data.
+
+        Earlier versions tried: (1) fake random prices, then (2) a 30-day
+        loop that assumed varying the `date` request field would return that
+        day's historical snapshot. Both produced misleading charts - Agmarknet's
+        dashboard-data endpoint doesn't support arbitrary historical lookups;
+        the raw record only ever has today's price and yesterday's price.
+
+        There is no live endpoint that can hand us a real 30-day series on
+        demand - so we build one ourselves over time: every trend request
+        records today's real prices to a local log
+        (market_scraper.py::record_todays_snapshot_if_needed), and this reads
+        back whatever real days have accumulated so far
+        (get_local_price_history). Immediately after deploy that's just 1-2
+        real points; it genuinely grows to a real 30-day window after 30 days
+        of the app being used. On day one, we bootstrap with the one extra
+        real historical point Agmarknet's snapshot itself provides
+        (yesterday's price) so the chart isn't a single dot from the start.
+        """
         try:
             crop = message.content.get("crop", "unknown crop")
-            logger.info(f"Generating simulated trend analysis for: {crop}")
+            logger.info(f"Analyzing real trend data for: {crop}")
 
-            # Simulate fetching historical data (replace with real data later)
-            # Generate some plausible fake historical prices for the last 30 days
-            today = datetime.now()
-            historical_prices = []
-            base_price = random.randint(1500, 5000) # Base price for the crop
-            for i in range(30, 0, -1):
-                date = (today - timedelta(days=i)).strftime("%Y-%m-%d")
-                # Simulate price fluctuation around the base price with a slight upward trend
-                price_fluctuation = random.uniform(-0.05, 0.07) # +/- 5-7% fluctuation
-                price = base_price * (1 + price_fluctuation + (0.001 * (30-i))) # Slight upward trend factor
-                price = round(price, 2)
-                historical_prices.append({"date": date, "price": price})
-                base_price = price # Next day's price starts from previous day
+            await record_todays_snapshot_if_needed()
+            historical_prices = await get_local_price_history(crop, days=180)
 
-            # Generate a simple trend summary based on simulated data
-            start_price = historical_prices[0]["price"]
-            end_price = historical_prices[-1]["price"]
-            trend_percentage = ((end_price - start_price) / start_price) * 100
-            
-            if trend_percentage > 5:
-                trend_summary = f"Prices for {crop} have shown a noticeable upward trend over the past month (approx. {trend_percentage:.1f}% increase)."
-            elif trend_percentage < -5:
-                trend_summary = f"Prices for {crop} have shown a noticeable downward trend over the past month (approx. {trend_percentage:.1f}% decrease)."
+            # Bootstrap: if our local log doesn't yet reach back to
+            # "yesterday" (e.g. this is the first day the log has run),
+            # splice in the one extra real historical point Agmarknet's own
+            # snapshot gives us for free, so day one still shows a real
+            # 2-point trend instead of a single dot.
+            matches = await get_scraper().get_prices(crop)
+            record = matches[0] if matches else None
+            if record and record.get("price_1d_ago") is not None:
+                today_date = record["date"]
+                yesterday_date = (datetime.strptime(today_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+                have_dates = {h["date"] for h in historical_prices}
+                if yesterday_date not in have_dates:
+                    historical_prices = sorted(
+                        historical_prices + [{"date": yesterday_date, "price": record["price_1d_ago"]}],
+                        key=lambda h: h["date"]
+                    )
+
+            if len(historical_prices) >= 2:
+                start_price = historical_prices[0]["price"]
+                end_price = historical_prices[-1]["price"]
+                trend_percentage = ((end_price - start_price) / start_price) * 100
+                span_days = len(historical_prices)
+                span = f"{historical_prices[0]['date']} to {historical_prices[-1]['date']}"
+
+                coverage_note = (
+                    "" if span_days >= 25 else
+                    f" (We started tracking real daily prices recently, so this covers {span_days} "
+                    "real recorded days so far rather than a full 30 - it'll keep growing.)"
+                )
+
+                if trend_percentage > 5:
+                    trend_summary = f"Prices for {crop} have risen by approximately {trend_percentage:.1f}% ({span}).{coverage_note}"
+                elif trend_percentage < -5:
+                    trend_summary = f"Prices for {crop} have fallen by approximately {abs(trend_percentage):.1f}% ({span}).{coverage_note}"
+                else:
+                    trend_summary = f"Prices for {crop} have stayed relatively stable (change of {trend_percentage:.1f}%, {span}).{coverage_note}"
+            elif len(historical_prices) == 1:
+                trend_summary = (
+                    f"Today's price for {crop} is ₹{historical_prices[0]['price']:.0f} per quintal. "
+                    "We've just started tracking daily prices for this feature - check back tomorrow for a real trend."
+                )
             else:
-                trend_summary = f"Prices for {crop} have remained relatively stable over the past month (change of {trend_percentage:.1f}%)."
+                trend_summary = (
+                    f"We couldn't find real market data for '{crop}' on Agmarknet right now. "
+                    "Try a different crop name, or check back later."
+                )
 
             # Store result in context if needed
             context_id = message.context.get("session_id") if message.context else None
@@ -273,7 +352,7 @@ class MarketAnalyzerAgent(Agent):
                 context_protocol.update_context(context_id, {
                     f"trend_analysis_{crop}": {
                         "summary": trend_summary,
-                        "historical_data": historical_prices # Include historical data for potential future use (e.g., charting)
+                        "historical_data": historical_prices
                     }
                 })
 
@@ -282,14 +361,14 @@ class MarketAnalyzerAgent(Agent):
                 receiver=message.sender,
                 content={
                     "message": trend_summary, 
-                    "historical_data": historical_prices # Optionally return historical data too
+                    "historical_data": historical_prices
                 },
                 message_type="trend_analysis_result",
                 context=message.context
             )
 
         except Exception as e:
-            logger.error(f"Error generating simulated trends for {crop}: {e}")
+            logger.error(f"Error analyzing trends for {crop}: {e}")
             return Message(
                 sender=self.agent_type,
                 receiver=message.sender,
@@ -381,6 +460,28 @@ class VoiceAssistantAgent(Agent):
                 # This is likely a yield prediction question
                 should_route = True
                 target_agent = AgentType.YIELD_PREDICTOR
+
+                # Simplified keyword extraction, same spirit as the market
+                # branch below - a voice transcript doesn't give us structured
+                # area/season/state, so we pass what we can detect (crop) and
+                # let YieldPredictorAgent fill sensible defaults for the rest.
+                common_crops = ["wheat", "rice", "cotton", "sugarcane", "soybean", "maize", "onion", "potato"]
+                crop = next((c for c in common_crops if c in transcript.lower()), None)
+
+                if crop:
+                    yield_response = await self.send_message(
+                        receiver=AgentType.YIELD_PREDICTOR,
+                        content={"yield_input": {"crop": crop.capitalize()}},
+                        message_type="predict_yield",
+                        context=message.context
+                    )
+                    if yield_response and "result" in yield_response.content:
+                        result = yield_response.content["result"]
+                else:
+                    result = (
+                        f"{result} To estimate yield I'll also need to know the crop - "
+                        "could you say which crop you mean?"
+                    )
                 
             elif any(word in transcript.lower() for word in ["price", "market", "sell", "cost", "mandi"]):
                 # This is likely a market-related question

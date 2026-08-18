@@ -38,6 +38,13 @@ class YieldPredictionResponse(BaseModel):
     estimated_production: float
     recommendations: List[str]
     weather_data: Optional[Dict] = None
-    
+
+    # Transparency fields: which prediction path produced this number.
+    # "ml" = trained XGBoost model (see app/models/train_yield_model.py);
+    # "heuristic" = rule-based fallback, used when the crop/state isn't in
+    # the training data's vocabulary.
+    model_source: Optional[str] = None
+    model_r2: Optional[float] = None
+
     class Config:
         populate_by_name = True  # Allow populating model using both alias and field name

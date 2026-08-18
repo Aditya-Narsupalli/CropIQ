@@ -79,6 +79,28 @@ class Agent:
             logger.warning(f"Agent {self.agent_type.value} has no handler for message type {message.message_type}")
             return None
 
+    async def send_message(self, receiver: AgentType, content: Any, message_type: str, context: Dict[str, Any] = None) -> Optional[Message]:
+        """Send a message to another agent via the coordinator.
+
+        Moved here from CropDoctorAgent (previously the *only* class that had
+        it - every other agent inheriting from the base `Agent` class,
+        including MarketAnalyzerAgent and VoiceAssistantAgent in agents.py,
+        would raise AttributeError the moment they tried to call
+        self.send_message(...), silently breaking any inter-agent routing.
+        """
+        if self.coordinator:
+            message = Message(
+                sender=self.agent_type,
+                receiver=receiver,
+                content=content,
+                message_type=message_type,
+                context=context
+            )
+            return await self.coordinator.route_message(message)
+        else:
+            logger.error(f"Agent {self.agent_type.value} has no coordinator to send messages")
+            return None
+
 try:
     from google import genai
 except Exception:
@@ -252,23 +274,6 @@ class CropDoctorAgent(Agent):
             content=response_text,
             message_type="chat_response"
         )
-
-
-        
-    async def send_message(self, receiver: AgentType, content: Any, message_type: str, context: Dict[str, Any] = None) -> Optional[Message]:
-        """Send message to another agent via coordinator"""
-        if self.coordinator:
-            message = Message(
-                sender=self.agent_type,
-                receiver=receiver,
-                content=content,
-                message_type=message_type,
-                context=context
-            )
-            return await self.coordinator.route_message(message)
-        else:
-            logger.error(f"Agent {self.agent_type.value} has no coordinator to send messages")
-            return None
 
 class AgentCoordinator:
     """Central coordinator for managing agent communication"""

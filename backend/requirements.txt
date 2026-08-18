@@ -18,6 +18,8 @@ python-multipart>=0.0.9            # File uploads for FastAPI
 numpy>=1.24.0,<2.0.0               # Numerical operations for yield prediction
 pandas
 xgboost
+scikit-learn                       # LabelEncoder + train/test split for yield & microfarm ROI models
+joblib                              # Model (de)serialization
 
 # --- HTTP & Scraping ---
 httpx>=0.27.0,<0.28.0              # Async HTTP client for scraping

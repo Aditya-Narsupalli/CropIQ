@@ -7,7 +7,7 @@ class DiseaseResponse(BaseModel):
 
     class Config:
         # Example for OpenAPI documentation generation
-        schema_extra = {
+        schema_extra =  {
             "example": {
                 "analysis": "The image shows signs of Powdery Mildew. Symptoms include white, powdery spots on leaves. Suggested management: Improve air circulation and consider using approved fungicides.",
                 "filename": "plant_image_01.jpg"
