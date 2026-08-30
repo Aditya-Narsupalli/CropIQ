@@ -1,0 +1,29 @@
+name: Daily Agmarknet price refresh
+
+# Runs once a day, independent of anyone opening the app, so the Upstash
+# price-snapshot log (used for the market trend charts) never has a gap on
+# days with no visitors. Also wakes a sleeping Render free-tier instance.
+on:
+  schedule:
+    # 02:00 UTC = 7:30 AM IST. Edit the minute/hour to taste.
+    - cron: "0 2 * * *"
+  workflow_dispatch: {} # lets you trigger it manually from the Actions tab to test
+
+jobs:
+  refresh-snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call backend cron endpoint
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          BACKEND_URL: ${{ secrets.BACKEND_URL }} # e.g. https://cropiq-1ijh.onrender.com
+        run: |
+          if [ -z "$BACKEND_URL" ]; then
+            echo "BACKEND_URL secret is not set. Add it in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          curl -sf -X GET \
+            -H "X-Cron-Secret: $CRON_SECRET" \
+            "$BACKEND_URL/api/v1/market/cron/refresh-snapshot" \
+            && echo "Snapshot refresh triggered successfully" \
+            || (echo "Snapshot refresh failed" && exit 1)

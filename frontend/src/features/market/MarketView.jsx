@@ -1,4 +1,4 @@
-﻿import React, { useEffect, useState } from "react";
+﻿import React, { useEffect, useState, useRef } from "react";
 import { useLanguage } from "../../context/LanguageContext";
 import { getMarketPricesApi, getMarketTrendsApi } from "../../services/api";
 import {
@@ -37,11 +37,24 @@ const MarketView = () => {
   const [priceChangeData, setPriceChangeData] = useState({});
   const [currentPage, setCurrentPage] = useState(1);
   const [itemsPerPage, setItemsPerPage] = useState(5);
+  const [lastRefreshedAt, setLastRefreshedAt] = useState(null);
+  const lastRefreshedAtRef = useRef(null);
   const { t } = useLanguage();
 
+  // How often to silently re-poll /market/prices while this tab stays open.
+  // Agmarknet itself only publishes new numbers once a day, and the daily
+  // cron (.github/workflows/daily-market-refresh.yml) is what actually
+  // pushes each day's new snapshot to Upstash - so there's nothing to gain
+  // from polling more often than once a day. This just makes sure a tab
+  // left open across midnight picks up that day's update on its own.
+  const AUTO_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
   useEffect(() => {
-    const fetchData = async () => {
-      setLoading(true);
+    // `silent` skips the full-page spinner/error state so a background
+    // refresh doesn't yank the UI out from under someone mid-read; it just
+    // swaps the numbers in place once the new data arrives.
+    const fetchData = async (silent = false) => {
+      if (!silent) setLoading(true);
       try {
         const pricesJson = await getMarketPricesApi();
         setMarketData(pricesJson.market_data || []);
@@ -58,13 +71,42 @@ const MarketView = () => {
         setPriceChangeData(changes);
 
         setError("");
+        const now = new Date();
+        setLastRefreshedAt(now);
+        lastRefreshedAtRef.current = now;
       } catch (err) {
         console.error("Market data fetch error:", err);
-        setError(`Failed to load market data: ${err.message}`);
+        // A background refresh failing (e.g. one flaky request) shouldn't
+        // blank out data that's already on screen with a big error banner -
+        // only surface the error state for the initial load.
+        if (!silent) setError(`Failed to load market data: ${err.message}`);
       }
-      setLoading(false);
+      if (!silent) setLoading(false);
     };
+
     fetchData();
+
+    // Keep the already-open page current without the user hitting reload,
+    // while still only actually checking once a day:
+    // 1) a background poll every 24h, and
+    // 2) a refresh when the tab regains visibility, but ONLY if the last
+    //    check was on a different calendar day - so alt-tabbing back and
+    //    forth during the same day doesn't trigger extra requests beyond
+    //    the once-a-day cadence.
+    const intervalId = setInterval(() => fetchData(true), AUTO_REFRESH_INTERVAL_MS);
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== "visible") return;
+      const lastCheck = lastRefreshedAtRef.current;
+      const isNewDay = !lastCheck || lastCheck.toDateString() !== new Date().toDateString();
+      if (isNewDay) fetchData(true);
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
   }, []);
 
   const fetchTrendData = async (crop) => {
@@ -230,6 +272,11 @@ const MarketView = () => {
               </p>
             );
           })()}
+          {lastRefreshedAt && (
+            <p className="text-xs text-gray-400 mt-1">
+              Last checked at {lastRefreshedAt.toLocaleTimeString()} · auto-refreshes daily
+            </p>
+          )}
         </div>
 
         {/* Main Content */}

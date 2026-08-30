@@ -1,10 +1,14 @@
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, Header
 from app.core.ai_services import get_market_summary_ai
-from app.services.market_scraper import get_all_prices, get_scraper
+from app.services.market_scraper import get_all_prices, get_scraper, record_todays_snapshot_if_needed
 from app.core.multi_agent import AgentType, Message, coordinator, context_protocol
+from app.core.config import get_settings
 import uuid
+import logging
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -128,6 +132,60 @@ async def get_market_trends_path_param(crop: str):
     safe for this reason; use GET /trends?crop=... instead (see below),
     which has no such ambiguity for any character."""
     return await get_market_trends(crop)
+
+
+@router.get("/cron/refresh-snapshot", status_code=200)
+async def refresh_snapshot(
+    authorization: Optional[str] = Header(None),
+    x_cron_secret: Optional[str] = Header(None, alias="X-Cron-Secret"),
+):
+    """Daily snapshot trigger, meant to be called by an external scheduler
+    (GitHub Actions / Vercel Cron / cron-job.org), NOT by the frontend.
+
+    This exists because record_todays_snapshot_if_needed() was previously
+    only ever invoked as a side-effect of a real visitor opening the Market
+    page and hitting /trends - so on any day nobody opened the app, that
+    day's price never got written to Upstash and the "30-day" trend would
+    have a gap. Calling this once a day, independent of traffic, closes
+    that gap.
+
+    Auth: accepts either
+      - Authorization: Bearer <CRON_SECRET>   (this is the header Vercel
+        Cron automatically attaches when a project env var named
+        CRON_SECRET is set, so it works for free with no extra config if
+        you trigger this via a Vercel Cron job hitting the rewritten
+        /api/... path)
+      - X-Cron-Secret: <CRON_SECRET>          (simplest option for GitHub
+        Actions / curl / cron-job.org)
+
+    If CRON_SECRET is not set in the environment, the endpoint is disabled
+    (503) rather than silently running unauthenticated - the snapshot log
+    is app data anyone could otherwise poke at without a secret configured.
+    """
+    settings = get_settings()
+    if not settings.CRON_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="CRON_SECRET is not configured on the server - set it in your environment to enable this endpoint.",
+        )
+
+    bearer_token = None
+    if authorization and authorization.lower().startswith("bearer "):
+        bearer_token = authorization[7:]
+
+    if settings.CRON_SECRET not in (bearer_token, x_cron_secret):
+        raise HTTPException(status_code=401, detail="Invalid or missing cron secret")
+
+    try:
+        records = await get_all_prices()
+        await record_todays_snapshot_if_needed()
+        return {
+            "status": "ok",
+            "commodities_fetched": len(records),
+        }
+    except Exception as e:
+        logger.error(f"Cron snapshot refresh failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Snapshot refresh failed: {str(e)}")
 
 
 @router.get("/trends", status_code=200)

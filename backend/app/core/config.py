@@ -20,6 +20,13 @@ class Settings:
     # dev, NOT fine for production on Render without them set.
     UPSTASH_REDIS_REST_URL: str = os.getenv("UPSTASH_REDIS_REST_URL", "")
     UPSTASH_REDIS_REST_TOKEN: str = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+
+    # Shared secret for the /market/cron/refresh-snapshot endpoint. This lets
+    # an external scheduler (GitHub Actions, Vercel Cron, cron-job.org, etc.)
+    # trigger the daily Agmarknet snapshot write without depending on a real
+    # visitor loading the site. Set this to a long random string in Render's
+    # env vars and give the same value to whatever scheduler you use.
+    CRON_SECRET: str = os.getenv("CRON_SECRET", "")
     # Add other settings if needed
     PROJECT_NAME: str = "FarmGenius Backend"
     MAX_FILE_SIZE_MB: int = 5 # Max file size in Megabytes for uploads
