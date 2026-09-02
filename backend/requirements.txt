@@ -1,4 +1,4 @@
-# FarmGenius Backend Requirements
+# CropIQ Backend Requirements
 # Install with: pip install -r requirements.txt
 
 # --- Core Web Framework ---

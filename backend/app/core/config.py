@@ -8,6 +8,20 @@ load_dotenv()
 class Settings:
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_NOT_SET")
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "YOUR_GROQ_API_KEY_NOT_SET")
+
+    # Secondary/fallback chat model, tried when the primary model
+    # (chat_agent.ChatAgent.gemini_model_name) is rate-limited or its daily
+    # quota is exhausted. Pick a model with a much higher RPD (requests/day)
+    # from Google AI Studio's rate-limits page - on the free tier, "Flash
+    # Lite" generations tend to carry a far higher daily cap than full
+    # "Flash" models. Get the exact API model id (not just the display name
+    # shown in the console) by running `python backend/scripts/list_models.py`.
+    GEMINI_FALLBACK_MODEL: str = os.getenv("GEMINI_FALLBACK_MODEL", "models/gemini-flash-lite-latest")
+
+    # Optional third tier: a safety-net model with an even bigger daily
+    # quota (e.g. an open Gemma model), tried only if BOTH the primary and
+    # GEMINI_FALLBACK_MODEL above are exhausted. Leave blank to disable.
+    GEMINI_SAFETY_NET_MODEL: str = os.getenv("GEMINI_SAFETY_NET_MODEL", "")
     OPENWEATHER_API_KEY: str = os.getenv("OPENWEATHER_API_KEY", "")
     # NOTE: Live market prices (market_scraper.py) call agmarknet.gov.in's
     # public dashboard-data API directly - no API key is required.
@@ -28,7 +42,7 @@ class Settings:
     # env vars and give the same value to whatever scheduler you use.
     CRON_SECRET: str = os.getenv("CRON_SECRET", "")
     # Add other settings if needed
-    PROJECT_NAME: str = "FarmGenius Backend"
+    PROJECT_NAME: str = "CropIQ Backend"
     MAX_FILE_SIZE_MB: int = 5 # Max file size in Megabytes for uploads
 
 

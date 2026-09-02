@@ -1,5 +1,5 @@
 """
-Specialized agents for the FarmGenius multi-agent system.
+Specialized agents for the CropIQ multi-agent system.
 Each agent is responsible for a specific domain of expertise.
 """
 import asyncio

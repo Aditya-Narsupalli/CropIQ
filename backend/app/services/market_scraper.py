@@ -1,5 +1,5 @@
 """
-Market price scraper for FarmGenius.
+Market price scraper for CropIQ.
 
 Pulls LIVE commodity price & arrival data directly from the official
 Agmarknet dashboard API (https://agmarknet.gov.in/home -> "Go" button):
@@ -324,6 +324,26 @@ async def record_todays_snapshot_if_needed() -> None:
             return
         log[reported_date] = day_prices
         await _save_snapshot_log(log)
+
+
+async def get_latest_snapshot() -> Optional[Dict[str, Any]]:
+    """Return the most recently recorded day's prices from the Redis-backed
+    snapshot log (see _load_snapshot_log), as {"date": ..., "prices": {crop: price}}.
+
+    Live requests to Agmarknet's dashboard-data API can fail at request time
+    (rate limiting, transient outages, or the endpoint blocking a given
+    server's IP) even though a daily cron job
+    (record_todays_snapshot_if_needed, triggered via /market/cron/refresh-snapshot)
+    has already written that day's - or a recent day's - real prices to
+    Redis. Callers that need "today's price" but can tolerate it being the
+    last successfully recorded day (rather than failing outright) should
+    fall back to this instead of only relying on the live scraper.
+    """
+    log = await _load_snapshot_log()
+    if not log:
+        return None
+    latest_date = max(log.keys())
+    return {"date": latest_date, "prices": log[latest_date]}
 
 
 async def get_local_price_history(commodity: str, days: int = 30) -> List[Dict[str, Any]]:

@@ -1,10 +1,11 @@
 """
-Chat assistant API endpoints for FarmGenius
+Chat assistant API endpoints for CropIQ
 This module provides endpoints for interacting with the general-purpose AI chat assistant.
 """
 from fastapi import APIRouter, HTTPException, Depends, Body, File, UploadFile
 from fastapi.responses import StreamingResponse, FileResponse
 import io
+import logging
 import tempfile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -18,6 +19,7 @@ import json
 from app.core.multi_agent import AgentType, Message, coordinator, context_protocol
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 class ChatInput(BaseModel):
     """Model for chat input data"""
@@ -26,7 +28,9 @@ class ChatInput(BaseModel):
     model: Optional[str] = Field("gemini", description="Model to use (only gemini is supported)")
     language: Optional[str] = Field("en", description="Language code (en, hi, mr)")
     context_data: Optional[Dict[str, Any]] = Field(None, description="Additional context for the chat")
-    agent: Optional[str] = Field("general_assistant", description="Expert agent to handle the message")
+    location: Optional[str] = Field(None, description="Free-text location (e.g. 'Baramati, Maharashtra'), used to ground weather-related answers")
+    latitude: Optional[float] = Field(None, description="Latitude, if already known client-side - skips geocoding for weather lookups")
+    longitude: Optional[float] = Field(None, description="Longitude, if already known client-side - skips geocoding for weather lookups")
 
 class ChatResponse(BaseModel):
     """Model for chat response data"""
@@ -97,20 +101,49 @@ async def stt(file: UploadFile = File(...), language: str = Body("en-US", embed=
     return {"transcript": transcript}
 
 @router.post("/speech-chat")
-async def speech_chat(file: UploadFile = File(...), language: str = Body("en-US", embed=True)):
+async def speech_chat(
+    file: UploadFile = File(...),
+    language: str = Body("en-US", embed=True),
+    encoding: str = Body("WEBM_OPUS", embed=True),
+):
     """
     Accepts an audio file, transcribes it with Google Cloud STT, sends to chat AI, and returns the response as audio and text using Google Cloud TTS.
+
+    `encoding` should match how the browser actually recorded the audio -
+    MediaRecorder produces WebM/Opus (Chrome/Edge) or Ogg/Opus (Firefox) by
+    default, never raw LINEAR16/WAV, so the STT config must match or Google
+    Cloud will fail to decode it.
     """
-    client_stt = speech.SpeechClient()
+    encoding_map = {
+        "WEBM_OPUS": speech.RecognitionConfig.AudioEncoding.WEBM_OPUS,
+        "OGG_OPUS": speech.RecognitionConfig.AudioEncoding.OGG_OPUS,
+        "LINEAR16": speech.RecognitionConfig.AudioEncoding.LINEAR16,
+    }
+    audio_encoding = encoding_map.get(encoding.upper(), speech.RecognitionConfig.AudioEncoding.WEBM_OPUS)
+
+    try:
+        client_stt = speech.SpeechClient()
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Google Cloud Speech-to-Text isn't configured on the server "
+                "(GOOGLE_APPLICATION_CREDENTIALS is missing or invalid). "
+                f"Underlying error: {e}"
+            ),
+        )
     audio_content = await file.read()
     audio = speech.RecognitionAudio(content=audio_content)
     config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        encoding=audio_encoding,
         language_code=language,
         audio_channel_count=1,
         enable_automatic_punctuation=True
     )
-    response = client_stt.recognize(config=config, audio=audio)
+    try:
+        response = client_stt.recognize(config=config, audio=audio)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Google Cloud Speech-to-Text request failed: {e}")
     text = " ".join([result.alternatives[0].transcript for result in response.results])
     if not text:
         raise HTTPException(status_code=400, detail="Could not transcribe audio.")
@@ -120,16 +153,27 @@ async def speech_chat(file: UploadFile = File(...), language: str = Body("en-US"
     ai_text = chat_response.response
 
     # Google Cloud TTS
-    tts_client = texttospeech.TextToSpeechClient()
-    synthesis_input = texttospeech.SynthesisInput(text=ai_text)
-    voice = texttospeech.VoiceSelectionParams(
-        language_code=language,
-        ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
-    )
-    audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
-    tts_response = tts_client.synthesize_speech(
-        input=synthesis_input, voice=voice, audio_config=audio_config
-    )
+    try:
+        tts_client = texttospeech.TextToSpeechClient()
+        synthesis_input = texttospeech.SynthesisInput(text=ai_text)
+        voice = texttospeech.VoiceSelectionParams(
+            language_code=language,
+            ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
+        )
+        audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
+        tts_response = tts_client.synthesize_speech(
+            input=synthesis_input, voice=voice, audio_config=audio_config
+        )
+    except Exception as e:
+        # We already have a real transcript + text answer at this point -
+        # don't fail the whole request just because the spoken-reply half
+        # broke. Return the text and let the frontend skip audio playback.
+        logger.warning(f"Google Cloud TTS failed in speech-chat, returning text only: {e}")
+        return {
+            "user_transcript": text,
+            "ai_text": ai_text,
+            "ai_audio_base64": None,
+        }
     audio_base64 = base64.b64encode(tts_response.audio_content).decode("utf-8")
     return {
         "user_transcript": text,
@@ -157,41 +201,31 @@ async def chat_message(chat_input: ChatInput = Body(...)):
         context_protocol.set_context(session_id, {
             "language": chat_input.language,
             "last_message": chat_input.message,
+            "location": chat_input.location,
+            "latitude": chat_input.latitude,
+            "longitude": chat_input.longitude,
             **(chat_input.context_data or {})
         })
 
-        # Determine the expert agent to route to
-        agent_map = {
-            "general_assistant": AgentType.CHAT_ASSISTANT,
-            "market_expert": AgentType.MARKET_EXPERT,
-            "weather_advisor": AgentType.WEATHER_ADVISOR,
-            "crop_doctor": AgentType.CROP_DOCTOR,
-        }
-        selected_agent = agent_map.get(chat_input.agent or "general_assistant", AgentType.CHAT_ASSISTANT)
-
-        # Use a unique system prompt per agent for demonstration
-        system_prompts = {
-            AgentType.CHAT_ASSISTANT: "You are FarmGenius, your general agriculture AI assistant across India.",
-            AgentType.MARKET_EXPERT: "You are MarketExpert: Provide expert analysis and advice on agricultural markets, prices, and trends across India.",
-            AgentType.WEATHER_ADVISOR: "You are WeatherAdvisor: Provide expert advice on weather patterns, forecasts, and climate impact on farming in India.",
-            AgentType.CROP_DOCTOR: "You are CropDoctor: Provide expert advice on crop diseases, soil, and crop management for Indian agriculture.",
-        }
-        system_prompt = system_prompts.get(selected_agent, system_prompts[AgentType.CHAT_ASSISTANT])
-
-        # Send the message to the selected expert agent
+        # Single unified chat assistant handles every message - it carries
+        # crop, weather, and market expertise together instead of routing to
+        # separate per-topic agents, so conversation memory and reliability
+        # handling are consistent no matter what the user asks about.
         message = await coordinator.route_message(
             Message(
                 sender=AgentType.COORDINATOR,
-                receiver=selected_agent,
+                receiver=AgentType.CHAT_ASSISTANT,
                 content={
                     "message": chat_input.message,
                     "model": chat_input.model,
-                    "system_prompt": system_prompt
                 },
                 message_type="chat",
                 context={
                     "session_id": session_id,
-                    "language": chat_input.language
+                    "language": chat_input.language,
+                    "location": chat_input.location,
+                    "latitude": chat_input.latitude,
+                    "longitude": chat_input.longitude,
                 }
             )
         )
