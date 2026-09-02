@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useCallback } from "react";
 // TTS/STT browser support check
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition || null;
 const synth = window.speechSynthesis || null;
-import { chatAssistantApi, multilingualChatApi, API_BASE_URL } from '../../services/api';
+import { chatAssistantApi, API_BASE_URL } from '../../services/api';
 import { 
   FaPaperPlane, 
   FaSpinner, 
@@ -38,14 +38,6 @@ const FaChartLine = ({ className }) => (
     <path d="M64 64c0-17.7-14.3-32-32-32S0 46.3 0 64V400c0 44.2 35.8 80 80 80H480c17.7 0 32-14.3 32-32s-14.3-32-32-32H80c-8.8 0-16-7.2-16-16V64zm406.6 86.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L320 210.7l-57.4-57.4c-12.5-12.5-32.8-12.5-45.3 0l-112 112c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0L240 221.3l57.4 57.4c12.5 12.5 32.8 12.5 45.3 0l128-128z"/>
   </svg>
 );
-
-// Custom agent icons that match theme
-const AGENT_AVATARS = {
-  general_assistant: <GiFarmTractor className="text-amber-600" />,
-  market_expert: <FaChartLine className="text-blue-600" />,
-  weather_advisor: <FaCloudSun className="text-sky-600" />,
-  crop_doctor: <FaSeedling className="text-green-600" />
-};
 
 // Reusing FadeInSection component from YieldPredictor for consistency
 const FadeInSection = ({ children, delay = 0 }) => {
@@ -120,7 +112,7 @@ function ChatAssistant() {
   const recognitionRef = useRef(null);
   const [recording, setRecording] = useState(false);
   const [mediaRecorder, setMediaRecorder] = useState(null);
-  const [audioChunks, setAudioChunks] = useState([]);
+  const audioChunksRef = useRef([]);
   const [audioUrl, setAudioUrl] = useState(null);
   const audioPlayerRef = useRef(null);
 
@@ -130,18 +122,27 @@ function ChatAssistant() {
     setAudioUrl(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new window.MediaRecorder(stream);
+      // MediaRecorder never produces raw WAV/LINEAR16 - pick whichever
+      // compressed container this browser actually supports so the backend
+      // can be told the right encoding to hand to Google Cloud STT.
+      const candidateTypes = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/ogg'];
+      const mimeType = candidateTypes.find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || '';
+      const recorder = mimeType ? new window.MediaRecorder(stream, { mimeType }) : new window.MediaRecorder(stream);
       setMediaRecorder(recorder);
-      setAudioChunks([]);
+      audioChunksRef.current = [];
       recorder.start();
       setRecording(true);
       recorder.ondataavailable = (e) => {
-        setAudioChunks((prev) => [...prev, e.data]);
+        if (e.data && e.data.size > 0) {
+          audioChunksRef.current.push(e.data);
+        }
       };
       recorder.onstop = async () => {
         setRecording(false);
-        const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
-        await handleSendAudio(audioBlob);
+        const actualType = recorder.mimeType || mimeType || 'audio/webm';
+        const audioBlob = new Blob(audioChunksRef.current, { type: actualType });
+        audioChunksRef.current = [];
+        await handleSendAudio(audioBlob, actualType);
         stream.getTracks().forEach(track => track.stop());
       };
     } catch {
@@ -158,13 +159,15 @@ function ChatAssistant() {
   };
 
   // Send audio to backend and play response
-  const handleSendAudio = async (audioBlob) => {
+  const handleSendAudio = async (audioBlob, mimeType = 'audio/webm') => {
     setLoading(true);
     setError("");
     try {
+      const isOgg = mimeType.includes('ogg');
       const formData = new FormData();
-      formData.append('file', audioBlob, 'input.wav');
+      formData.append('file', audioBlob, isOgg ? 'input.ogg' : 'input.webm');
       formData.append('language', selectedLanguage);
+      formData.append('encoding', isOgg ? 'OGG_OPUS' : 'WEBM_OPUS');
       const response = await fetch(`${API_BASE_URL}/chat/speech-chat`, {
         method: 'POST',
         body: formData
@@ -173,17 +176,25 @@ function ChatAssistant() {
       try {
         data = await response.json();
       } catch (err) {
-        setError("Speech chat: Invalid server response (not JSON). Check backend.");
-        console.error("Speech chat: Invalid JSON response", err);
+        // Log the technical detail for developers; show the user something plain.
+        console.error("Speech chat: non-JSON response", err);
+        setError("Something went wrong with voice input. Please try again or type your message.");
         return;
       }
-      console.log("Speech chat backend response:", data);
       if (!response.ok) {
-        setError(`Speech chat failed: ${data?.detail || response.statusText}`);
+        console.error("Speech chat failed:", response.status, data?.detail);
+        if (response.status === 503) {
+          setError("Voice recording isn't available right now - please type your message instead.");
+        } else if (response.status === 502) {
+          setError("Couldn't reach the voice service - please try again in a moment.");
+        } else {
+          setError("Didn't catch that clearly. Try recording again, or type your message.");
+        }
         return;
       }
       if (!data.user_transcript) {
-        setError("Speech chat: No transcript returned from backend. Check backend implementation.");
+        console.error("Speech chat: no transcript in response", data);
+        setError("Didn't catch that clearly. Try recording again, or type your message.");
         return;
       }
       setInput(data.user_transcript);
@@ -224,7 +235,6 @@ function ChatAssistant() {
   ]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [selectedAgent, setSelectedAgent] = useState("crop_doctor");
   const [selectedLanguage, setSelectedLanguage] = useState("en");
   const [location, setLocation] = useState("");
   const [latitude, setLatitude] = useState(19.2183);
@@ -269,13 +279,6 @@ function ChatAssistant() {
     return `${(fallbackLat ?? 0).toFixed(4)}, ${(fallbackLng ?? 0).toFixed(4)}`;
   }, []);
 
-  const agentOptions = [
-    { value: "general_assistant", label: "Farm Assistant", icon: <GiFarmTractor /> },
-    { value: "market_expert", label: "Market Expert", icon: <FaChartLine /> },
-    { value: "weather_advisor", label: "Weather Advisor", icon: <FaCloudSun /> },
-    { value: "crop_doctor", label: "Crop Doctor", icon: <FaSeedling /> },
-  ];
-
   const languageOptions = [
     { value: "en", label: "English" },
     { value: "hi", label: "हिंदी (Hindi)" },
@@ -288,8 +291,6 @@ function ChatAssistant() {
     { value: "kn", label: "ಕನ್ನಡ (Kannada)" },
     { value: "ml", label: "മലയാളം (Malayalam)" }
   ];
-
-  const activeAgent = agentOptions.find((agent) => agent.value === selectedAgent) || agentOptions[0];
 
   // Scroll to bottom of chat when messages update
   useEffect(() => {
@@ -308,7 +309,14 @@ function ChatAssistant() {
 
   // STT: Start browser speech recognition
   const handleStartRecognition = () => {
-    if (!SpeechRecognition) return;
+    if (!SpeechRecognition) {
+      // No Web Speech API in this browser at all - fall back to record & upload immediately.
+      setSttMode('upload');
+      setError("");
+      handleStartRecording();
+      return;
+    }
+    setError("");
     setRecognitionActive(true);
     const recognition = new SpeechRecognition();
     recognition.lang = selectedLanguage === 'en' ? 'en-US' : selectedLanguage;
@@ -334,7 +342,26 @@ function ChatAssistant() {
         // handleSend({ preventDefault: () => {} });
       }
     };
-    recognition.onerror = () => setRecognitionActive(false);
+    recognition.onerror = (event) => {
+      setRecognitionActive(false);
+      const reason = event?.error;
+      if (reason === 'not-allowed' || reason === 'service-not-allowed') {
+        // Same OS/browser mic permission gate as the upload path uses, so
+        // falling back wouldn't help here - surface the real problem instead.
+        setError("Microphone access was blocked. Allow microphone permission for this site and try again.");
+      } else if (reason === 'no-speech') {
+        setError("Didn't catch any speech - try again and speak after tapping the mic.");
+      } else if (reason === 'network') {
+        // The browser's built-in speech service (usually a Google cloud call)
+        // is unreachable - our own backend's speech-chat endpoint is a
+        // separate path and may still work, so fall back to it.
+        setSttMode('upload');
+        setError("Your browser's voice service is unreachable - switched to record & upload mode. Tap the mic again to record.");
+      } else {
+        setSttMode('upload');
+        setError("Voice input failed - switched to record & upload mode. Tap the mic again to record.");
+      }
+    };
     recognition.onend = () => setRecognitionActive(false);
     recognition.start();
   };
@@ -344,6 +371,18 @@ function ChatAssistant() {
     if (recognitionRef.current) {
       recognitionRef.current.stop();
       setRecognitionActive(false);
+    }
+  };
+
+  // Single entry point for the mic button - routes to whichever STT path
+  // is currently active (native browser recognition, or record & upload).
+  const micActive = sttMode === 'browser' ? recognitionActive : recording;
+  const micSupported = !!(SpeechRecognition || (navigator.mediaDevices && navigator.mediaDevices.getUserMedia));
+  const handleMicClick = () => {
+    if (sttMode === 'browser') {
+      recognitionActive ? handleStopRecognition() : handleStartRecognition();
+    } else {
+      recording ? handleStopRecording() : handleStartRecording();
     }
   };
 
@@ -360,31 +399,24 @@ function ChatAssistant() {
     setSpeechCaptured(false);
     
     try {
-      // Use multilingual API if a non-English language is selected, otherwise use regular chat API
-      if (selectedLanguage !== "en") {
-        const data = await multilingualChatApi({
-          message: input,
-          session_id: sessionId,
-          language: selectedLanguage,
-          location: location
-        });
-        
-        // Store session ID for conversation continuity
-        if (!sessionId) {
-          setSessionId(data.session_id);
-        }
-        
-        setMessages([...newMessages, { role: "assistant", content: data.response || "(No response)" }]);
-      } else {
-        const data = await chatAssistantApi({
-          message: input,
-          history: newMessages.filter(m => m.role !== 'error').map(m => ({ role: m.role, content: m.content })),
-          agent: selectedAgent,
-          location: location
-        });
-        
-        setMessages([...newMessages, { role: "assistant", content: data.response || "(No response)" }]);
+      // One unified chat API handles every language - it used to branch to
+      // a separate multilingual endpoint with its own (weaker) implementation.
+      const data = await chatAssistantApi({
+        message: input,
+        history: newMessages.filter(m => m.role !== 'error').map(m => ({ role: m.role, content: m.content })),
+        location: location,
+        latitude: latitude,
+        longitude: longitude,
+        session_id: sessionId,
+        language: selectedLanguage
+      });
+      // Store session ID for conversation continuity - without this,
+      // the backend has no way to remember anything said in this chat.
+      if (!sessionId && data.session_id) {
+        setSessionId(data.session_id);
       }
+
+      setMessages([...newMessages, { role: "assistant", content: data.response || "(No response)" }]);
     } catch {
       let errorMsg = "An error occurred.";
       
@@ -417,22 +449,6 @@ function ChatAssistant() {
     }
   };
 
-  // Handle agent change
-  const handleAgentChange = (e) => {
-    const newAgent = e.target.value;
-    setSelectedAgent(newAgent);
-    
-    // Add system message indicating agent change
-    const selectedAgentInfo = agentOptions.find(a => a.value === newAgent);
-    setMessages([
-      ...messages,
-      { 
-        role: "system", 
-        content: `Switching to ${selectedAgentInfo?.label || 'Assistant'} mode. How can I help you?` 
-      }
-    ]);
-  };
-  
   // Handle language change
   const handleLanguageChange = (e) => {
     const newLanguage = e.target.value;
@@ -644,11 +660,8 @@ function ChatAssistant() {
               CropIQ AI Chat
             </h1>
             <p className="text-green-50 max-w-2xl text-sm md:text-base">
-              Get personalized agricultural advice, weather insights, and farming recommendations from your expert Crop Doctor.
+              Get personalized agricultural advice, weather insights, market prices, and crop health guidance - all from one assistant.
             </p>
-            <div className="mt-4 inline-flex items-center rounded-full bg-white/15 px-3 py-1 text-sm font-medium">
-              {activeAgent?.label || "Crop Doctor"} mode is active
-            </div>
           </div>
         </FadeInSection>
       </div>
@@ -684,32 +697,13 @@ function ChatAssistant() {
             <div className="flex items-center justify-between mb-6 border-b pb-4 border-gray-100 relative z-10">
               <div className="flex items-center space-x-3">
                 <div className="bg-amber-100 p-2 rounded-full">
-                  {activeAgent?.icon || <GiFarmTractor className="text-amber-600 text-xl" />}
+                  <GiFarmTractor className="text-amber-600 text-xl" />
                 </div>
                 <h3 className="text-xl font-semibold text-gray-800">
-                  {activeAgent?.label || 'Farm Assistant'}
+                  CropIQ Assistant
                 </h3>
               </div>
               <div className="flex items-center space-x-3">
-                <div className="relative">
-                  <select
-                    value={selectedAgent}
-                    onChange={handleAgentChange}
-                    className="pl-3 pr-8 py-2 border border-amber-200 rounded-lg focus:ring-2 focus:ring-amber-300 focus:border-amber-300 bg-white text-gray-700 text-sm appearance-none cursor-pointer transition-colors hover:border-amber-400"
-                    aria-label="Choose Expert Agent"
-                    disabled={selectedLanguage !== "en"}
-                  >
-                    {agentOptions.map(opt => (
-                      <option key={opt.value} value={opt.value}>{opt.label}</option>
-                    ))}
-                  </select>
-                  <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-amber-600">
-                    <svg className="w-4 h-4 fill-current" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
-                      <path d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" />
-                    </svg>
-                  </div>
-                </div>
-
                 {/* Location Input with Auto-detect */}
                 <div className="flex flex-col gap-2 w-full">
                   <div className="flex items-center gap-2">
@@ -807,7 +801,7 @@ function ChatAssistant() {
                   >
                     {msg.role !== "user" && msg.role !== "system" && (
                       <div className="w-8 h-8 rounded-full bg-amber-100 flex items-center justify-center mr-2 flex-shrink-0 self-end mb-2">
-                        {AGENT_AVATARS[selectedAgent] || <GiFarmTractor className="text-amber-600" />}
+                        <GiFarmTractor className="text-amber-600" />
                       </div>
                     )}
                     <div
@@ -905,13 +899,21 @@ function ChatAssistant() {
                 style={{ minWidth: 0 }}
               />
               <button
-                className="flex items-center justify-center h-10 w-10 rounded-lg bg-green-600 text-white hover:bg-green-700 transition"
-                onClick={recognitionActive ? handleStopRecognition : handleStartRecognition}
-                disabled={loading}
-                aria-label={recognitionActive ? "Stop speech recognition" : "Start speech recognition"}
-                title="Voice input"
+                className={`flex items-center justify-center h-10 w-10 rounded-lg text-white transition ${
+                  micSupported ? "bg-green-600 hover:bg-green-700" : "bg-gray-400 cursor-not-allowed"
+                }`}
+                onClick={handleMicClick}
+                disabled={loading || !micSupported}
+                aria-label={micActive ? "Stop voice input" : "Start voice input"}
+                title={
+                  !micSupported
+                    ? "Voice input isn't available in this environment"
+                    : sttMode === 'upload'
+                    ? "Record & upload voice input"
+                    : "Voice input"
+                }
               >
-                {recognitionActive ? <FaStopCircle /> : <FaMicrophone />}
+                {micActive ? <FaStopCircle /> : <FaMicrophone />}
               </button>
               <button
                 className="flex items-center justify-center h-10 w-10 rounded-lg bg-green-600 text-white hover:bg-green-700 transition"

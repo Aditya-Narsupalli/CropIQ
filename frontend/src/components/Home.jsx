@@ -181,7 +181,7 @@ const Home = () => {
           answer: "Our market data is updated daily from AgMarkNet and other official sources. Prices reflect real-time trading information from mandis across India."
         },
         {
-          question: "Does FarmGenius work in regions without internet connectivity?",
+          question: "Does CropIQ work in regions without internet connectivity?",
           answer: "For best experience, an internet connection is recommended. We're working on offline features for low-connectivity regions."
         },
         {
@@ -244,7 +244,7 @@ const Home = () => {
     },
     "Voice & Chat Assistant": {
       title: "Voice & Chat Assistant",
-      details: "Talk to FarmGenius in your preferred language - English, Hindi, or Marathi. Ask questions, get step-by-step farming guidance, and receive expert support hands-free, anytime and anywhere on your farm.",
+      details: "Talk to CropIQ in your preferred language - English, Hindi, or Marathi. Ask questions, get step-by-step farming guidance, and receive expert support hands-free, anytime and anywhere on your farm.",
       keyFeatures: [
         "Voice-based interaction in 3 languages",
         "Step-by-step farming guidance",
