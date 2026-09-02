@@ -65,8 +65,9 @@ def _extract_crop(text: str) -> Optional[str]:
 
 class ChatAgent(Agent):
     """
-    General-purpose AI chat agent that can have extended conversations
-    with users about any topic, with specialized knowledge about agriculture.
+    Farming-focused AI chat agent with specialized knowledge across crop
+    health, weather, and markets - scoped to agricultural topics, not a
+    general-purpose chatbot.
     """
     
     def __init__(self):
