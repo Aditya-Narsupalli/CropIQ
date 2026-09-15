@@ -931,6 +931,10 @@ function ChatAssistant() {
               )}
             </div>
 
+            <p className="text-center text-[11px] text-gray-400 mt-2">
+              AI-generated - please verify prices, dosages, and scheme details before acting on them.
+            </p>
+
              {/* Error message - prominent and spaced */}
              {error && (
                <div className="bg-red-50 border-l-4 border-red-500 p-4 mt-6 rounded-lg shadow flex items-start max-w-lg mx-auto">

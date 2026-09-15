@@ -34,6 +34,51 @@ _KNOWN_CROPS = sorted(CROP_COEFFICIENTS.keys(), key=len, reverse=True)
 _MARKET_KEYWORDS = ["price", "prices", "market", "mandi", "sell", "selling", "rate", "rates", "cost", "quintal"]
 _WEATHER_KEYWORDS = ["weather", "forecast", "rain", "rainfall", "temperature", "climate", "humidity", "monsoon", "storm"]
 
+# Forced function-call schema used by _classify_query below to decide which
+# live data source (if any) a message needs. Kept as a single function with
+# an enum, rather than two optional functions ("get_market_price" /
+# "get_weather"), so there's always exactly one clear answer rather than a
+# "the model didn't call anything" case to interpret.
+_CLASSIFY_TOOL = {
+    "function_declarations": [
+        {
+            "name": "classify_farming_query",
+            "description": (
+                "Classify a farmer's chat message so the assistant knows which live "
+                "data source (if any) to fetch before answering. Call this for every "
+                "message, including greetings and general questions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "intent": {
+                        "type": "string",
+                        "enum": ["market", "weather", "general"],
+                        "description": (
+                            "'market' if the user is asking about crop prices, mandi "
+                            "rates, MSP, or selling - even phrased indirectly, e.g. "
+                            "'what will I get for my onions' or 'is now a good time to "
+                            "sell my wheat'. 'weather' if asking about current or "
+                            "forecast weather, rain, or climate conditions. 'general' "
+                            "for everything else, including greetings, crop health, "
+                            "government schemes, and farming advice."
+                        ),
+                    },
+                    "crop": {
+                        "type": "string",
+                        "description": (
+                            "The specific crop or commodity named in the message, if "
+                            "any (e.g. 'onion', 'wheat'). Omit this field entirely if "
+                            "no specific crop is named."
+                        ),
+                    },
+                },
+                "required": ["intent"],
+            },
+        }
+    ]
+}
+
 
 _LANGUAGE_NAMES = {
     "en": "English", "hi": "Hindi", "mr": "Marathi", "ta": "Tamil", "te": "Telugu",
@@ -61,6 +106,37 @@ def _extract_crop(text: str) -> Optional[str]:
         if re.search(r'\b' + re.escape(crop.lower()) + r'\b', lowered):
             return crop
     return None
+
+
+def _flag_unverified_numbers(response: str, live_data_block: str) -> str:
+    """Cross-check ₹ amounts and percentages the model cited in its answer
+    against the real [LIVE DATA] block it was given. The system prompt
+    already tells it not to invent numbers, but that's a request, not a
+    constraint - models still slip occasionally. This is a blunt safety
+    net for exactly that failure mode: it won't catch every fabrication
+    (e.g. a wrong number disguised as a date, or hallucinated prose with no
+    digits), but it catches the specific, highest-risk case of a confident
+    price/percentage sitting right next to real ones.
+
+    Numbers are compared with commas stripped so formatting differences
+    (e.g. "2,450" vs "2450") don't cause false positives.
+    """
+    normalize = lambda s: s.replace(',', '').strip()
+    trusted = set(re.findall(r'\d+(?:\.\d+)?', live_data_block.replace(',', '')))
+
+    rupee_claims = [normalize(m) for m in re.findall(r'₹\s?([\d,]+(?:\.\d+)?)', response)]
+    pct_claims = [normalize(m) for m in re.findall(r'(\d+(?:\.\d+)?)\s?%', response)]
+
+    unverified = [f"₹{c}" for c in rupee_claims if c not in trusted]
+    unverified += [f"{c}%" for c in pct_claims if c not in trusted]
+
+    if unverified:
+        logger.warning(f"chat_assistant cited figures not present in the live data it was given: {unverified}")
+        response += (
+            "\n\n_(Note: please double-check the figures above against Agmarknet or "
+            "your local mandi/weather source before relying on them.)_"
+        )
+    return response
 
 
 class ChatAgent(Agent):
@@ -153,6 +229,21 @@ class ChatAgent(Agent):
             "block says no data was found, say so plainly instead of inventing figures."
         )
 
+        # Extra-strict rule for the two categories where a confident-but-wrong
+        # number causes real harm rather than just an inaccurate answer: an
+        # incorrect pesticide/fertilizer dose can damage a crop, and scheme
+        # amounts change every budget cycle so a remembered figure is often
+        # stale even when it sounds authoritative.
+        self.general_system_prompt += (
+            "\n\nFor chemical/fertilizer dosages and government scheme amounts "
+            "specifically: never state an exact quantity, rate, or rupee amount from "
+            "memory. Describe the general approach instead, and tell the user to "
+            "confirm the precise figure with their local Krishi Vigyan Kendra, "
+            "agriculture extension officer, or the scheme's official page - unless "
+            "that exact figure was given to you in this conversation, a [LIVE DATA] "
+            "block, or a search result you're citing."
+        )
+
         # Fallback model used if the primary model is transiently overloaded
         # or has hit its daily quota. Configurable via GEMINI_FALLBACK_MODEL
         # so a better-quota model can be swapped in without a code change -
@@ -183,6 +274,52 @@ class ChatAgent(Agent):
         else:
             logger.warning("Gemini API key not configured; chat will use fallback responses")
     
+    async def _classify_query(self, user_message: str) -> tuple:
+        """Decide which live data source (if any) this message needs, using
+        a cheap forced function call instead of brittle keyword matching -
+        so a paraphrase like "what will I get for my onions" is still
+        recognized as a market question even though it contains none of
+        _MARKET_KEYWORDS. Also extracts the crop name in the same call.
+
+        Falls back to the old keyword/regex approach if this call fails for
+        any reason (client not configured, transient API error, malformed
+        response) - classification is a routing aid, not something that
+        should ever break the chat turn if it has a bad moment.
+        """
+        if not self.gemini_client:
+            return _detect_intent(user_message), _extract_crop(user_message)
+        try:
+            response = await asyncio.to_thread(
+                self.gemini_client.models.generate_content,
+                model=self.gemini_model_name,
+                contents=user_message,
+                config={
+                    "tools": [_CLASSIFY_TOOL],
+                    "tool_config": {
+                        "function_calling_config": {
+                            "mode": "ANY",
+                            "allowed_function_names": ["classify_farming_query"],
+                        }
+                    },
+                    "temperature": 0,
+                },
+            )
+            calls = response.function_calls or []
+            if not calls:
+                raise ValueError("classifier returned no function call")
+            args = calls[0].args or {}
+            intent = args.get("intent") or "general"
+            if intent not in ("market", "weather", "general"):
+                intent = "general"
+            # Trust the model's crop extraction first since it handles
+            # paraphrases and multi-word commodity names the regex can't,
+            # but fall back to the regex if it didn't name one.
+            crop = args.get("crop") or _extract_crop(user_message)
+            return intent, crop
+        except Exception as e:
+            logger.warning(f"LLM query classification failed, falling back to keyword matching: {e}")
+            return _detect_intent(user_message), _extract_crop(user_message)
+
     async def handle_chat(self, message: Message) -> Optional[Message]:
         """
         Handle a chat message from the user and generate a response
@@ -241,11 +378,11 @@ class ChatAgent(Agent):
             # anything else, let Gemini ground itself with a live Google
             # Search instead of answering purely from training memory.
             intent = "general"
+            live_data_block = None
             try:
-                intent = _detect_intent(original_message)
-                live_data_block = None
+                intent, crop_hint = await self._classify_query(original_message)
                 if intent == "market":
-                    live_data_block = await self._get_market_context(original_message)
+                    live_data_block = await self._get_market_context(original_message, crop_hint=crop_hint)
                 elif intent == "weather":
                     live_data_block = await self._get_weather_context(location, latitude, longitude)
                 if live_data_block:
@@ -261,6 +398,12 @@ class ChatAgent(Agent):
                 response = await self._chat_with_gemini(
                     user_message, chat_history, use_search=(intent == "general"), language=language
                 )
+                if live_data_block:
+                    # Only cross-check when we actually handed the model a
+                    # ground-truth block to be graded against - search-grounded
+                    # general answers legitimately cite figures (e.g. scheme
+                    # amounts) that won't appear verbatim in any block here.
+                    response = _flag_unverified_numbers(response, live_data_block)
             else:
                 response = self._fallback_response(user_message, not_configured=True)
             
@@ -292,7 +435,7 @@ class ChatAgent(Agent):
         # this would use the streaming capabilities of Gemini
         return await self.handle_chat(message)
     
-    async def _get_market_context(self, user_message: str) -> Optional[str]:
+    async def _get_market_context(self, user_message: str, crop_hint: Optional[str] = None) -> Optional[str]:
         """Fetch real market prices relevant to the question and format them
         as a labeled block for Gemini to reason over, instead of asking
         Gemini to recall or guess prices from its training data.
@@ -304,7 +447,10 @@ class ChatAgent(Agent):
         /market/cron/refresh-snapshot job) so a live-request hiccup doesn't
         mean the assistant has no real numbers at all.
         """
-        crop = _extract_crop(user_message)
+        # Prefer the crop the classifier already extracted (handles
+        # paraphrases/multi-word names) and only fall back to the plain
+        # regex if the classifier didn't return one.
+        crop = crop_hint or _extract_crop(user_message)
         records = []
         try:
             if crop:
