@@ -35,6 +35,17 @@ class Settings:
     UPSTASH_REDIS_REST_URL: str = os.getenv("UPSTASH_REDIS_REST_URL", "")
     UPSTASH_REDIS_REST_TOKEN: str = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
+    # Upstash Vector (separate product/index from Upstash Redis above) -
+    # holds the cleaned Kisan Call Centre Q&A archive for RAG grounding of
+    # the chat assistant's general farming-advice answers. Create the index
+    # in the Upstash console with a built-in embedding model attached (e.g.
+    # mxbai-embed-large-v1) so ingestion/query can pass raw text and let
+    # Upstash handle embedding - no separate embedding API needed. If unset,
+    # the chat agent simply skips KCC-archive grounding.
+    UPSTASH_VECTOR_REST_URL: str = os.getenv("UPSTASH_VECTOR_REST_URL", "")
+    UPSTASH_VECTOR_REST_TOKEN: str = os.getenv("UPSTASH_VECTOR_REST_TOKEN", "")
+
+
     # Shared secret for the /market/cron/refresh-snapshot endpoint. This lets
     # an external scheduler (GitHub Actions, Vercel Cron, cron-job.org, etc.)
     # trigger the daily Agmarknet snapshot write without depending on a real

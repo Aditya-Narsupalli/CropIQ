@@ -19,6 +19,11 @@ try:
 except Exception:  # pragma: no cover - library may be missing in some environments
     genai = None
 
+try:
+    from upstash_vector import Index as UpstashVectorIndex
+except Exception:  # pragma: no cover - library may be missing in some environments
+    UpstashVectorIndex = None
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -244,6 +249,27 @@ class ChatAgent(Agent):
             "block, or a search result you're citing."
         )
 
+        # How to treat retrieved KCC archive material. Worth stating explicitly:
+        # retrieval makes old advice *available*, not *current* - a dosage
+        # pulled from a 2018 call log is still an unverified figure, just
+        # fetched instead of remembered.
+        self.general_system_prompt += (
+            "\n\nIf a [REFERENCE] block of past Kisan Call Centre answers is provided, "
+            "treat it as real expert practice from India's national farmer helpline "
+            "archive - it's a genuine reference point, not a guess. If the user's "
+            "location is known (given earlier in the message as 'Location: ...'), use "
+            "it: adapt region-specific details like sowing dates, varieties, or local "
+            "practices to what actually fits that location, rather than repeating the "
+            "archived answer's specifics if they were logged from elsewhere in India. "
+            "If the user's location isn't known, answer generally and suggest they "
+            "share their location or district for advice tailored to their area. "
+            "Regardless of location, treat dosages, chemical names, and amounts from "
+            "the archive as unverified - describe the general approach and tell the "
+            "user to confirm the exact figure locally or against a current source, "
+            "since pesticide formulations and scheme amounts change over time in a way "
+            "location doesn't fix. Never mention the reference block itself to the user."
+        )
+
         # Fallback model used if the primary model is transiently overloaded
         # or has hit its daily quota. Configurable via GEMINI_FALLBACK_MODEL
         # so a better-quota model can be swapped in without a code change -
@@ -273,6 +299,24 @@ class ChatAgent(Agent):
                 self.gemini_client = None
         else:
             logger.warning("Gemini API key not configured; chat will use fallback responses")
+
+        # KCC archive (RAG) via Upstash Vector - optional, same "degrade
+        # gracefully" treatment as everything else here. If unset, general
+        # farming-advice questions just skip archive grounding and fall
+        # through to search-grounded/plain answers as before.
+        self.kcc_index = None
+        if UpstashVectorIndex and settings.UPSTASH_VECTOR_REST_URL and settings.UPSTASH_VECTOR_REST_TOKEN:
+            try:
+                self.kcc_index = UpstashVectorIndex(
+                    url=settings.UPSTASH_VECTOR_REST_URL,
+                    token=settings.UPSTASH_VECTOR_REST_TOKEN,
+                )
+                logger.info("KCC archive (Upstash Vector) initialized successfully")
+            except Exception as e:
+                logger.error(f"Error initializing Upstash Vector index: {e}")
+                self.kcc_index = None
+        else:
+            logger.info("Upstash Vector not configured; chat will skip KCC-archive grounding")
     
     async def _classify_query(self, user_message: str) -> tuple:
         """Decide which live data source (if any) this message needs, using
@@ -385,6 +429,17 @@ class ChatAgent(Agent):
                     live_data_block = await self._get_market_context(original_message, crop_hint=crop_hint)
                 elif intent == "weather":
                     live_data_block = await self._get_weather_context(location, latitude, longitude)
+                else:
+                    # General farming-advice questions (pest/disease/practice/
+                    # scheme queries) get background grounding from the KCC
+                    # archive, on top of the live Google Search Gemini already
+                    # does for "general" below - the two are complementary,
+                    # not exclusive: search finds current info, the archive
+                    # finds how real KCC experts have answered similar
+                    # questions before.
+                    kcc_block = await self._get_kcc_reference_context(original_message)
+                    if kcc_block:
+                        user_message = f"{kcc_block}\n\n{user_message}"
                 if live_data_block:
                     user_message = f"{live_data_block}\n\n{user_message}"
             except Exception as e:
@@ -547,6 +602,65 @@ class ChatAgent(Agent):
             f"- Estimated rainfall over the next month (from 5-day forecast trend): "
             f"{weather['monthly_rainfall_estimate']:.1f} cm"
         )
+
+    async def _get_kcc_reference_context(self, user_message: str) -> Optional[str]:
+        """Retrieve similar past Kisan Call Centre expert Q&A pairs from
+        Upstash Vector, for background grounding on general farming-advice
+        questions (pest/disease/practice/scheme queries that aren't live
+        market or weather questions).
+
+        Deliberately labeled [REFERENCE], not [LIVE DATA]: this is historical
+        call-log data from the Kisan Call Centre archive - India's national
+        farmer helpline program (circa 2015-2021) - not a live or
+        verified-current source. The system prompt tells the model to treat
+        any dosage/figure from this block the same as anything else it isn't
+        certain is current - restate the approach and tell the user to
+        confirm locally, rather than quote it as settled fact.
+
+        Note on coverage: KCC is a national program, but this particular
+        extract is not an evenly distributed national sample - see
+        KCC_RAG_SETUP.md for the measured breakdown. That's why the block
+        warns the model not to assume the advice fits the user's region.
+        """
+        if not self.kcc_index:
+            return None
+        try:
+            results = await asyncio.to_thread(
+                self.kcc_index.query,
+                data=user_message,
+                top_k=3,
+                include_metadata=True,
+                include_data=True,
+            )
+        except Exception as e:
+            logger.warning(f"KCC archive lookup failed, skipping: {e}")
+            return None
+
+        # Score threshold is a rough starting point, not a tuned value - I
+        # can't call the live Upstash index from this environment to
+        # calibrate it against real query traffic, so watch actual retrieval
+        # quality once this is live and adjust if it's too strict/loose.
+        matches = [r for r in (results or []) if r.score is not None and r.score >= 0.80]
+        if not matches:
+            return None
+
+        lines = [
+            "[REFERENCE: past answers from India's Kisan Call Centre farmer helpline "
+            "archive - real expert practice, but historical (not verified current) and "
+            "logged from a specific place. If the user's location is known, adapt any "
+            "regional specifics (sowing dates, varieties, local practices) to fit it. "
+            "Treat dosages, chemical names, and amounts as unverified regardless of "
+            "location - describe the approach and tell the user to confirm the exact "
+            "figure locally.]"
+        ]
+        for i, m in enumerate(matches, 1):
+            past_question = m.data or ""
+            past_answer = (m.metadata or {}).get("answer", "")
+            if past_question and past_answer:
+                lines.append(f"{i}. Past Q: \"{past_question}\" -> Past A: \"{past_answer}\"")
+        if len(lines) == 1:
+            return None
+        return "\n".join(lines)
 
     def _append_grounding_sources(self, text: str, response) -> str:
         """When Gemini used Google Search grounding, append the real source

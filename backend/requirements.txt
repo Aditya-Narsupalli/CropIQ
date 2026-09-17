@@ -10,6 +10,7 @@ python-dotenv>=1.0.0,<2.0.0       # .env file support
 
 # --- AI & ML Integrations ---
 google-genai>=1.0.0  # Gemini API client (new SDK)
+upstash-vector>=0.6.0  # KCC archive RAG index for chat grounding
 # groq  # (Removed: No longer used)
 
 # --- Data & Image Processing ---
