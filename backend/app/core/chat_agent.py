@@ -39,51 +39,6 @@ _KNOWN_CROPS = sorted(CROP_COEFFICIENTS.keys(), key=len, reverse=True)
 _MARKET_KEYWORDS = ["price", "prices", "market", "mandi", "sell", "selling", "rate", "rates", "cost", "quintal"]
 _WEATHER_KEYWORDS = ["weather", "forecast", "rain", "rainfall", "temperature", "climate", "humidity", "monsoon", "storm"]
 
-# Forced function-call schema used by _classify_query below to decide which
-# live data source (if any) a message needs. Kept as a single function with
-# an enum, rather than two optional functions ("get_market_price" /
-# "get_weather"), so there's always exactly one clear answer rather than a
-# "the model didn't call anything" case to interpret.
-_CLASSIFY_TOOL = {
-    "function_declarations": [
-        {
-            "name": "classify_farming_query",
-            "description": (
-                "Classify a farmer's chat message so the assistant knows which live "
-                "data source (if any) to fetch before answering. Call this for every "
-                "message, including greetings and general questions."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "intent": {
-                        "type": "string",
-                        "enum": ["market", "weather", "general"],
-                        "description": (
-                            "'market' if the user is asking about crop prices, mandi "
-                            "rates, MSP, or selling - even phrased indirectly, e.g. "
-                            "'what will I get for my onions' or 'is now a good time to "
-                            "sell my wheat'. 'weather' if asking about current or "
-                            "forecast weather, rain, or climate conditions. 'general' "
-                            "for everything else, including greetings, crop health, "
-                            "government schemes, and farming advice."
-                        ),
-                    },
-                    "crop": {
-                        "type": "string",
-                        "description": (
-                            "The specific crop or commodity named in the message, if "
-                            "any (e.g. 'onion', 'wheat'). Omit this field entirely if "
-                            "no specific crop is named."
-                        ),
-                    },
-                },
-                "required": ["intent"],
-            },
-        }
-    ]
-}
-
 
 _LANGUAGE_NAMES = {
     "en": "English", "hi": "Hindi", "mr": "Marathi", "ta": "Tamil", "te": "Telugu",
@@ -319,50 +274,22 @@ class ChatAgent(Agent):
             logger.info("Upstash Vector not configured; chat will skip KCC-archive grounding")
     
     async def _classify_query(self, user_message: str) -> tuple:
-        """Decide which live data source (if any) this message needs, using
-        a cheap forced function call instead of brittle keyword matching -
-        so a paraphrase like "what will I get for my onions" is still
-        recognized as a market question even though it contains none of
-        _MARKET_KEYWORDS. Also extracts the crop name in the same call.
+        """Decide which live data source (if any) this message needs.
 
-        Falls back to the old keyword/regex approach if this call fails for
-        any reason (client not configured, transient API error, malformed
-        response) - classification is a routing aid, not something that
-        should ever break the chat turn if it has a bad moment.
+        NOTE: this previously made a separate forced-function-call Gemini
+        request to classify intent (to catch paraphrases like "what will I
+        get for my onions" that keyword matching misses). That doubled
+        Gemini API usage on every single chat message - one call to
+        classify, one to answer - which caused quota exhaustion in
+        production on the very first message of the day. Reverted to plain
+        keyword/regex matching, which costs zero extra API calls. If this
+        gets revisited, the right fix is folding classification into the
+        SAME generation call (via function declarations the model can
+        choose to invoke inline) rather than a separate preceding call -
+        but that needs to be verified against the live API first, not
+        shipped speculatively.
         """
-        if not self.gemini_client:
-            return _detect_intent(user_message), _extract_crop(user_message)
-        try:
-            response = await asyncio.to_thread(
-                self.gemini_client.models.generate_content,
-                model=self.gemini_model_name,
-                contents=user_message,
-                config={
-                    "tools": [_CLASSIFY_TOOL],
-                    "tool_config": {
-                        "function_calling_config": {
-                            "mode": "ANY",
-                            "allowed_function_names": ["classify_farming_query"],
-                        }
-                    },
-                    "temperature": 0,
-                },
-            )
-            calls = response.function_calls or []
-            if not calls:
-                raise ValueError("classifier returned no function call")
-            args = calls[0].args or {}
-            intent = args.get("intent") or "general"
-            if intent not in ("market", "weather", "general"):
-                intent = "general"
-            # Trust the model's crop extraction first since it handles
-            # paraphrases and multi-word commodity names the regex can't,
-            # but fall back to the regex if it didn't name one.
-            crop = args.get("crop") or _extract_crop(user_message)
-            return intent, crop
-        except Exception as e:
-            logger.warning(f"LLM query classification failed, falling back to keyword matching: {e}")
-            return _detect_intent(user_message), _extract_crop(user_message)
+        return _detect_intent(user_message), _extract_crop(user_message)
 
     async def handle_chat(self, message: Message) -> Optional[Message]:
         """
@@ -801,7 +728,11 @@ class ChatAgent(Agent):
                 # Only one attempt on the fallback model, not a full retry
                 # loop - if the primary is quota-exhausted or rate
                 # limited, hammering the fallback 3x too just adds delay.
-                return await _send_with_retries(self.fallback_model_name, max_retries=1)
+                return await _send_with_retries(
+                    self.fallback_model_name,
+                    max_retries=1,
+                    allow_search=False,
+                )
             except Exception as e2:
                 category2 = _classify_error(str(e2))
                 logger.warning(f"chat_assistant fallback model failed: {e2} (category={category2})")
@@ -824,48 +755,22 @@ class ChatAgent(Agent):
                     return self._fallback_response(user_message, error=str(e3))
 
     def _fallback_response(self, user_message: str, error: Optional[str] = None, not_configured: bool = False) -> str:
-        """Return a helpful, non-technical fallback response when AI is unavailable."""
-        message = user_message.lower()
-        if any(word in message for word in ["pest", "disease", "leaf", "fungus", "insect"]):
-            response = (
-                "For crop health issues, start by inspecting the affected leaves and stems closely. "
-                "Remove severely damaged parts, avoid overwatering, and use an appropriate local fungicide or insecticide "
-                "only if recommended for that crop. If the damage is spreading quickly, contact a local agriculture officer or extension service."
-            )
-        elif any(word in message for word in ["soil", "fertilizer", "nutrient", "manure"]):
-            response = (
-                "For soil and fertility questions, check the crop stage, recent weather, and whether the field has been overwatered or underfed. "
-                "A soil test is the best next step for choosing the right fertilizer or amendment."
-            )
-        elif any(word in message for word in ["market", "price", "sell", "price"]):
-            response = (
-                "For market and pricing questions, compare current local mandi rates, transport costs, and storage conditions before selling. "
-                "Timing and buyer quality requirements can affect the net return significantly."
-            )
-        else:
-            response = (
-                "I'm currently running in fallback mode because the AI service key is not configured. "
-                if not_configured else
-                "I'm having trouble reaching the AI service right now, so I can't give a full answer. "
-            )
-            response += "For general farming questions, share the crop, the issue you are facing, and the region, and I can still provide practical guidance."
+        """Plain, honest message when the AI service can't be reached.
 
-        # Plain, non-technical explanation of *why* - never show the raw
-        # exception/JSON to the user, just what it means and what to do.
-        if error:
-            category = "quota_exhausted" if ("check your plan and billing" in error.lower() or "quota" in error.lower()) else (
-                "rate_limited" if any(x in error.lower() for x in ['429', 'rate limit', '503', 'unavailable']) else "other"
-            )
-            if category == "quota_exhausted":
-                response += (
-                    "\n\n(The AI service has reached its usage limit for now - this should clear up on its own after "
-                    "a while. In the meantime, the guidance above should still help.)"
-                )
-            elif category == "rate_limited":
-                response += "\n\n(The AI service is briefly overloaded - please try again in a moment.)"
-            else:
-                response += "\n\n(The AI service is temporarily unavailable - please try again shortly.)"
-        return response
+        Deliberately NOT the previous behavior of guessing pseudo-advice from
+        keywords in the message and appending a category-specific technical
+        explanation (quota/rate-limit/etc). A guessed-at answer dressed up as
+        help is worse than plainly saying the assistant is down - the user
+        can't tell the difference between real guidance and a keyword-matched
+        guess, and the "should clear up on its own" wording was also
+        sometimes just wrong (e.g. an expired trial doesn't self-resolve).
+        `error` is accepted for signature compatibility with existing call
+        sites (which already log the real exception separately) but is
+        intentionally not surfaced to the user here.
+        """
+        if not_configured:
+            return "The assistant isn't set up yet. Please check back later."
+        return "Sorry, I'm unable to respond right now. Please try again in a little while."
     
     async def _get_chat_history(self, session_id: str) -> List[Dict[str, Any]]:
         """Get chat history from context"""

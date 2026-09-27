@@ -403,7 +403,10 @@ function ChatAssistant() {
       // a separate multilingual endpoint with its own (weaker) implementation.
       const data = await chatAssistantApi({
         message: input,
-        history: newMessages.filter(m => m.role !== 'error').map(m => ({ role: m.role, content: m.content })),
+        history: messages
+          .filter((m, index) => !(index === 0 && m.role === 'assistant'))
+          .filter(m => m.role !== 'error')
+          .map(m => ({ role: m.role, content: m.content })),
         location: location,
         latitude: latitude,
         longitude: longitude,
@@ -417,8 +420,9 @@ function ChatAssistant() {
       }
 
       setMessages([...newMessages, { role: "assistant", content: data.response || "(No response)" }]);
-    } catch {
-      let errorMsg = "An error occurred.";
+    } catch (error) {
+      console.error("Chat request failed:", error);
+      const errorMsg = error?.message || "Unable to reach the chat service.";
       
       setMessages([
         ...newMessages,

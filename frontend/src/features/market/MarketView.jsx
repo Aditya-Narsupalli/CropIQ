@@ -704,14 +704,9 @@ const MarketView = () => {
                           real change data instead of fabricating one. */}
                       {selectedCrop && !isFetchingCrop && (
                         <div className="mt-4 pt-4 border-t border-blue-200">
-                          <div className="flex justify-between items-center mb-2">
-                            <h5 className="font-semibold text-blue-700 text-sm">
-                              {t("marketAlerts")}
-                            </h5>
-                            <button className="text-xs bg-green-100 text-green-800 px-2 py-1 rounded-full hover:bg-green-200">
-                              {t("setPriceAlert")}
-                            </button>
-                          </div>
+                          <h5 className="font-semibold text-blue-700 text-sm mb-2">
+                            {t("marketAlerts")}
+                          </h5>
                           {(() => {
                             // Primary source: today's live Agmarknet fetch.
                             // Fallback: compute a real day-over-day change
