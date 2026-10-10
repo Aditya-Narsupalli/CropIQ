@@ -2,7 +2,7 @@
 from PIL import Image as PILImage
 import io
 import asyncio
-from typing import TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 
 # Import settings using the function
 from .config import get_settings
@@ -192,14 +192,47 @@ async def generate_text(prompt: str, use_search: bool = False) -> str:
 
 
 # --- Disease Prediction Function ---
+def _classifier_context(finding: Optional[dict]) -> str:
+    """Tell Gemini what CropIQ's trained classifier found, so the write-up
+    builds on it - and so Gemini says so plainly if the photo disagrees."""
+    if not finding:
+        return ""
+    others = ", ".join(f"{t['disease']} ({t['probability']:.0%})" for t in finding["top_predictions"][1:])
+    accuracy = f", about {finding['model_accuracy']:.0%} accurate on held-out field photos" if finding.get("model_accuracy") else ""
+    return (
+        f"\n\nCropIQ's trained disease classifier (trained on real field photos{accuracy}) analysed this "
+        f"{finding['crop']} photo and suggests: {finding['disease']} ({finding['confidence']:.0%} probability)"
+        + (f"; other possibilities: {others}" if others else "") + ". "
+        f"It only knows these {finding['crop']} conditions: {', '.join(finding['possible_diseases'])}. "
+        "Use this as strong evidence, but check it against what you see. If the photo clearly shows something "
+        "else (another disease, a pest, a nutrient deficiency, or not this crop), say so plainly and explain why. "
+        "Start your answer with the identification."
+    )
+
+
+def _references_context(references: Optional[list]) -> str:
+    """KCC expert answers for the identified disease (see services/kcc_archive.py)."""
+    if not references:
+        return ""
+    from app.services.kcc_archive import reference_block
+    return "\n\n" + reference_block(references) + (
+        "\nBase TREATMENT RECOMMENDATIONS on these where they fit what you see in the photo. "
+        "Never mention the reference block itself."
+    )
+
+
 async def get_disease_prediction(
     image_bytes: bytes,
     crop_type: str = "crop",
-    location: str = ""
+    location: str = "",
+    model_finding: Optional[dict] = None,
+    references: Optional[list] = None,
 ) -> str:
     """
     Analyzes an image using Gemini Vision model to detect crop diseases.
     Considers crop type and location for more accurate diagnosis.
+    If the trained classifier (app/services/disease_classifier.py) produced
+    a finding, it's given to Gemini as evidence to verify and build on.
     """
     if not gemini_client:
         return "Error: Gemini Vision model is not configured."
@@ -216,7 +249,10 @@ async def get_disease_prediction(
 
 Context: Crop: {crop_type}, Location: {location_context}
 
-Analyze the attached plant image and provide:
+Start your reply with exactly one line in this format (CropIQ uses it to look up expert advice):
+IDENTIFICATION: <the disease or pest name, or "Healthy", or "Unclear">
+
+Then analyze the attached plant image and provide:
 1. DISEASE/PEST IDENTIFICATION (with confidence level)
 2. VISIBLE SYMPTOMS (describe what you see)
 3. LIKELY CAUSES (why this occurs in the given location)
@@ -225,7 +261,7 @@ Analyze the attached plant image and provide:
 6. RECOVERY TIMELINE (estimate for improvement)
 
 Be practical for Indian farmers. Use bullet points. If image is unclear, state that.
-        """ + _ANTI_HALLUCINATION_NOTE + (
+        """ + _classifier_context(model_finding) + _references_context(references) + _ANTI_HALLUCINATION_NOTE + (
             "\n\nYou have Google Search available - use it if it would help confirm "
             "an identification you're unsure of, or find a locally relevant treatment "
             "product, rather than guessing from memory alone."

@@ -15,8 +15,10 @@ from gtts import gTTS
 import uuid
 import asyncio
 import json
+from urllib.parse import quote
 
 from app.core.multi_agent import AgentType, Message, coordinator, context_protocol
+from app.core.chat_agent import seed_history_if_missing
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -31,12 +33,18 @@ class ChatInput(BaseModel):
     location: Optional[str] = Field(None, description="Free-text location (e.g. 'Baramati, Maharashtra'), used to ground weather-related answers")
     latitude: Optional[float] = Field(None, description="Latitude, if already known client-side - skips geocoding for weather lookups")
     longitude: Optional[float] = Field(None, description="Longitude, if already known client-side - skips geocoding for weather lookups")
+    history: Optional[List[Dict[str, Any]]] = Field(None, description="The browser's copy of the conversation ([{role, content}]), used to restore context if the server lost it (e.g. after a restart)")
 
 class ChatResponse(BaseModel):
     """Model for chat response data"""
     response: str
     session_id: str
     model_used: str = "models/gemini-2.5-pro"
+    # Provenance of the answer: {"type": "rag"|"gemini"|"live_data", "label", "detail", "citations": [...]}
+    # None when the model didn't actually answer (error/fallback text).
+    sources: Optional[Dict[str, Any]] = None
+    # 2-3 suggested next questions, shown as tappable chips under the answer
+    suggestions: List[str] = []
 
 class StreamChatInput(ChatInput):
     """Model for streaming chat input, extending ChatInput"""
@@ -68,7 +76,9 @@ async def text_to_speech(text: str = Body(..., embed=True), language: str = Body
     Convert text to speech audio using gTTS and return as an MP3 stream.
     """
     try:
-        tts = gTTS(text=text, lang=language)
+        # gTTS wants a bare language code ("hi"), not a locale ("hi-IN").
+        lang = (language or "en").split("-")[0].lower()
+        tts = gTTS(text=text[:3000], lang=lang)
         mp3_fp = io.BytesIO()
         tts.write_to_fp(mp3_fp)
         mp3_fp.seek(0)
@@ -90,7 +100,7 @@ async def stt(file: UploadFile = File(...), language: str = Body("en-US", embed=
     audio = speech.RecognitionAudio(content=audio_content)
     config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-        language_code=language,
+        language_code=_to_locale(language),
         audio_channel_count=1,
         enable_automatic_punctuation=True
     )
@@ -99,6 +109,60 @@ async def stt(file: UploadFile = File(...), language: str = Body("en-US", embed=
     if not transcript:
         raise HTTPException(status_code=400, detail="Could not transcribe audio.")
     return {"transcript": transcript}
+
+_STT_LOCALES = {
+    "en": "en-US", "hi": "hi-IN", "mr": "mr-IN", "gu": "gu-IN", "pa": "pa-IN",
+    "bn": "bn-IN", "te": "te-IN", "ta": "ta-IN", "kn": "kn-IN", "ml": "ml-IN",
+}
+
+
+def _to_locale(language: str) -> str:
+    """Google Cloud Speech/TTS want a full locale ("hi-IN"); the UI sends
+    either that or a bare code ("hi")."""
+    language = (language or "en").strip()
+    if "-" in language:
+        return language
+    return _STT_LOCALES.get(language.lower(), "en-US")
+
+
+@router.post("/transcribe")
+async def transcribe(
+    file: UploadFile = File(...),
+    language: str = Body("en-US", embed=True),
+    encoding: str = Body("WEBM_OPUS", embed=True),
+):
+    """Speech -> text only. This is what the mic's record-and-upload fallback
+    uses: unlike /speech-chat it doesn't also run a full Gemini answer and
+    text-to-speech that the UI would just throw away."""
+    encoding_map = {
+        "WEBM_OPUS": speech.RecognitionConfig.AudioEncoding.WEBM_OPUS,
+        "OGG_OPUS": speech.RecognitionConfig.AudioEncoding.OGG_OPUS,
+        "LINEAR16": speech.RecognitionConfig.AudioEncoding.LINEAR16,
+    }
+    audio_encoding = encoding_map.get(encoding.upper(), speech.RecognitionConfig.AudioEncoding.WEBM_OPUS)
+    try:
+        client_stt = speech.SpeechClient()
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Google Cloud Speech-to-Text isn't configured on the server (GOOGLE_APPLICATION_CREDENTIALS missing or invalid): {e}",
+        )
+    audio_content = await file.read()
+    config = speech.RecognitionConfig(
+        encoding=audio_encoding,
+        language_code=_to_locale(language),
+        audio_channel_count=1,
+        enable_automatic_punctuation=True,
+    )
+    try:
+        response = client_stt.recognize(config=config, audio=speech.RecognitionAudio(content=audio_content))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Google Cloud Speech-to-Text request failed: {e}")
+    text = " ".join(r.alternatives[0].transcript for r in response.results)
+    if not text:
+        raise HTTPException(status_code=400, detail="Could not transcribe audio.")
+    return {"transcript": text}
+
 
 @router.post("/speech-chat")
 async def speech_chat(
@@ -136,7 +200,7 @@ async def speech_chat(
     audio = speech.RecognitionAudio(content=audio_content)
     config = speech.RecognitionConfig(
         encoding=audio_encoding,
-        language_code=language,
+        language_code=_to_locale(language),
         audio_channel_count=1,
         enable_automatic_punctuation=True
     )
@@ -151,13 +215,14 @@ async def speech_chat(
     chat_input = ChatInput(message=text, language=language)
     chat_response = await chat_message(chat_input)
     ai_text = chat_response.response
+    sources = chat_response.sources
 
     # Google Cloud TTS
     try:
         tts_client = texttospeech.TextToSpeechClient()
         synthesis_input = texttospeech.SynthesisInput(text=ai_text)
         voice = texttospeech.VoiceSelectionParams(
-            language_code=language,
+            language_code=_to_locale(language),
             ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
         )
         audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
@@ -173,12 +238,14 @@ async def speech_chat(
             "user_transcript": text,
             "ai_text": ai_text,
             "ai_audio_base64": None,
+            "sources": sources,
         }
     audio_base64 = base64.b64encode(tts_response.audio_content).decode("utf-8")
     return {
         "user_transcript": text,
         "ai_text": ai_text,
-        "ai_audio_base64": audio_base64
+        "ai_audio_base64": audio_base64,
+        "sources": sources,
     }
 
 # ---
@@ -196,6 +263,7 @@ async def chat_message(chat_input: ChatInput = Body(...)):
     try:
         # Create or reuse session ID for context continuity
         session_id = chat_input.session_id or str(uuid.uuid4())
+        seed_history_if_missing(session_id, chat_input.history)
         
         # Set up context with language preference
         context_protocol.set_context(session_id, {
@@ -230,7 +298,10 @@ async def chat_message(chat_input: ChatInput = Body(...)):
             )
         )
         response_text = message.content if isinstance(message.content, str) else message.content.get("response", "(No response)")
-        return ChatResponse(response=response_text, session_id=session_id, model_used=chat_input.model)
+        sources = message.content.get("sources") if isinstance(message.content, dict) else None
+        suggestions = (message.content.get("suggestions") if isinstance(message.content, dict) else None) or []
+        return ChatResponse(response=response_text, session_id=session_id, model_used=chat_input.model,
+                            sources=sources, suggestions=suggestions)
 
 
     except HTTPException as http_exc:
@@ -253,6 +324,7 @@ async def stream_chat(chat_input: StreamChatInput = Body(...)):
     try:
         # Create or reuse session ID for context continuity
         session_id = chat_input.session_id or str(uuid.uuid4())
+        seed_history_if_missing(session_id, chat_input.history)
         
         # Set up context with language preference
         context_protocol.set_context(session_id, {
@@ -299,9 +371,15 @@ async def stream_chat(chat_input: StreamChatInput = Body(...)):
                 # Small delay to simulate streaming
                 await asyncio.sleep(0.05)
         
+        # The body is plain text chunks, so provenance travels in a header
+        # (URL-encoded JSON - headers must be ASCII). Same shape as the
+        # `sources` field on /chat/message.
+        sources = message.content.get("sources")
+        headers = {"X-Answer-Sources": quote(json.dumps(sources))} if sources else {}
         return StreamingResponse(
             fake_stream_generator(),
-            media_type="application/x-ndjson"
+            media_type="application/x-ndjson",
+            headers=headers,
         )
         
     except HTTPException as http_exc:

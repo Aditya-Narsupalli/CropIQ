@@ -4,20 +4,22 @@ This module provides a sophisticated chat agent with specialized knowledge
 across crop health, weather, and markets, scoped to farming-related topics.
 """
 import logging
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 import json
 import asyncio
 import re
+import time
 
 from app.core.config import get_settings
 from app.core.multi_agent import Agent, AgentType, Message, coordinator, context_protocol
-from app.services.market_scraper import get_scraper, get_all_prices, get_latest_snapshot
-from app.services.yield_prediction_service import get_geocode_data, get_weather_data, CROP_COEFFICIENTS
+from app.core import chat_tools
 
 try:
     from google import genai
+    from google.genai import types
 except Exception:  # pragma: no cover - library may be missing in some environments
     genai = None
+    types = None
 
 try:
     from upstash_vector import Index as UpstashVectorIndex
@@ -31,67 +33,71 @@ logger = logging.getLogger(__name__)
 # Load settings
 settings = get_settings()
 
-# Crop vocabulary reused from the yield model's coefficient table, so intent
-# detection recognizes the same crop names the rest of the app already knows
-# about rather than maintaining a second, drifting list.
-_KNOWN_CROPS = sorted(CROP_COEFFICIENTS.keys(), key=len, reverse=True)
-
-_MARKET_KEYWORDS = ["price", "prices", "market", "mandi", "sell", "selling", "rate", "rates", "cost", "quintal"]
-_WEATHER_KEYWORDS = ["weather", "forecast", "rain", "rainfall", "temperature", "climate", "humidity", "monsoon", "storm"]
-
-
 _LANGUAGE_NAMES = {
     "en": "English", "hi": "Hindi", "mr": "Marathi", "ta": "Tamil", "te": "Telugu",
     "kn": "Kannada", "gu": "Gujarati", "bn": "Bengali", "pa": "Punjabi", "ml": "Malayalam",
 }
 
+# Tool-call rounds per answer (e.g. weather -> prices -> answer). Bounded so a
+# confused model can't loop and burn quota.
+MAX_TOOL_ROUNDS = 3
 
-def _detect_intent(text: str) -> str:
-    """Cheap keyword-based intent check - good enough to decide which live
-    data source (if any) to ground the answer in before calling Gemini.
-    This mirrors the routing already used for voice commands in agents.py."""
-    lowered = text.lower()
-    if any(word in lowered for word in _MARKET_KEYWORDS):
-        return "market"
-    if any(word in lowered for word in _WEATHER_KEYWORDS):
-        return "weather"
-    return "general"
+# Server-side history kept per session (messages, not exchanges)
+MAX_HISTORY_MESSAGES = 30
 
 
-def _extract_crop(text: str) -> Optional[str]:
-    """Word-boundary match against known crop names - a plain substring
-    check would misfire on things like "market prices" containing "rice"."""
-    lowered = text.lower()
-    for crop in _KNOWN_CROPS:
-        if re.search(r'\b' + re.escape(crop.lower()) + r'\b', lowered):
-            return crop
-    return None
+_FOLLOWUPS_LINE = re.compile(r"\n?[ \t*_]*FOLLOWUPS?[ \t*_]*:[ \t*_]*(.+?)[ \t*_]*$", re.IGNORECASE)
 
 
-def _flag_unverified_numbers(response: str, live_data_block: str) -> str:
+def _split_followups(text: str) -> Tuple[str, List[str]]:
+    """Separate the trailing 'FOLLOWUPS: a | b | c' line from the answer."""
+    match = _FOLLOWUPS_LINE.search(text.rstrip())
+    if not match:
+        return text, []
+    questions = [q.strip(" -*\"'") for q in match.group(1).split("|")]
+    return text[:match.start()].rstrip(), [q for q in questions if 2 < len(q) <= 120][:3]
+
+
+def _to_number(text: str) -> Optional[float]:
+    try:
+        return float(text.replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _flag_unverified_numbers(response: str, trusted_text: str) -> str:
     """Cross-check ₹ amounts and percentages the model cited in its answer
-    against the real [LIVE DATA] block it was given. The system prompt
-    already tells it not to invent numbers, but that's a request, not a
-    constraint - models still slip occasionally. This is a blunt safety
-    net for exactly that failure mode: it won't catch every fabrication
-    (e.g. a wrong number disguised as a date, or hallucinated prose with no
-    digits), but it catches the specific, highest-risk case of a confident
-    price/percentage sitting right next to real ones.
+    against the real tool data it was given. The system prompt already tells
+    it not to invent numbers, but that's a request, not a constraint - models
+    still slip occasionally. This is a blunt safety net for exactly that
+    failure mode: it won't catch every fabrication, but it catches the
+    specific, highest-risk case of a confident price/percentage sitting right
+    next to real ones.
 
-    Numbers are compared with commas stripped so formatting differences
-    (e.g. "2,450" vs "2450") don't cause false positives.
+    Matching is tolerant of formatting and rounding: "₹2,450" matches 2450,
+    "₹1.01 lakh" matches 101,375, and anything within 1% of a real figure
+    counts as quoted rather than invented.
     """
-    normalize = lambda s: s.replace(',', '').strip()
-    trusted = set(re.findall(r'\d+(?:\.\d+)?', live_data_block.replace(',', '')))
+    trusted = [n for n in (_to_number(m) for m in re.findall(r"\d[\d,]*(?:\.\d+)?", trusted_text)) if n is not None]
 
-    rupee_claims = [normalize(m) for m in re.findall(r'₹\s?([\d,]+(?:\.\d+)?)', response)]
-    pct_claims = [normalize(m) for m in re.findall(r'(\d+(?:\.\d+)?)\s?%', response)]
+    def is_trusted(value: float) -> bool:
+        return any(abs(value - t) <= max(0.01 * abs(t), 0.051) for t in trusted)
 
-    unverified = [f"₹{c}" for c in rupee_claims if c not in trusted]
-    unverified += [f"{c}%" for c in pct_claims if c not in trusted]
+    unverified = []
+    for amount, unit in re.findall(r"₹\s?(\d[\d,]*(?:\.\d+)?)\s*(lakh|crore)?", response, flags=re.IGNORECASE):
+        value = _to_number(amount)
+        if value is None:
+            continue
+        scaled = value * {"lakh": 1e5, "crore": 1e7}.get(unit.lower(), 1) if unit else value
+        if not (is_trusted(value) or is_trusted(scaled)):
+            unverified.append(f"₹{amount}{' ' + unit if unit else ''}")
+    for pct in re.findall(r"(\d+(?:\.\d+)?)\s?%", response):
+        value = _to_number(pct)
+        if value is not None and not is_trusted(value):
+            unverified.append(f"{pct}%")
 
     if unverified:
-        logger.warning(f"chat_assistant cited figures not present in the live data it was given: {unverified}")
+        logger.warning(f"chat_assistant cited figures not present in its tool data: {unverified}")
         response += (
             "\n\n_(Note: please double-check the figures above against Agmarknet or "
             "your local mandi/weather source before relying on them.)_"
@@ -105,15 +111,15 @@ class ChatAgent(Agent):
     health, weather, and markets - scoped to agricultural topics, not a
     general-purpose chatbot.
     """
-    
+
     def __init__(self):
         super().__init__(AgentType.CHAT_ASSISTANT)
         self.register_handler("chat", self.handle_chat)
         self.register_handler("stream_chat", self.handle_stream_chat)
-        
+
         # Initialize AI models
         self._init_ai_models()
-        
+
         # System prompt
         # This used to be split across four separate agents/personas (general
         # assistant, market expert, weather advisor, crop doctor), each with
@@ -155,7 +161,11 @@ class ChatAgent(Agent):
     When you don't know something, admit it clearly rather than making up information.
     """
         # Preference: do not ask users to upload photos in chat; request text descriptions of symptoms instead
-        self.general_system_prompt += "\nPlease do not ask users to upload photos in chat. Instead, request clear text descriptions of symptoms, crop type, and location."
+        self.general_system_prompt += (
+            "\nPlease do not ask users to upload photos in chat. Instead, request clear text descriptions "
+            "of symptoms, crop type, and location. For photo-based diagnosis, point them to CropIQ's "
+            "Disease Detector page."
+        )
 
         # Anti-hallucination and anti-repetition guardrails. The greeting
         # instruction matters most when session memory is intact (see
@@ -170,23 +180,41 @@ class ChatAgent(Agent):
             "- Don't pad answers with filler openers like 'Great question!' or restating "
             "the user's question back to them before answering.\n"
             "- Never invent specific numbers, prices, statistics, study results, place "
-            "names, or dates that were not given to you in this conversation or in a "
-            "[LIVE DATA] block. If you don't have a real figure, say so plainly and give "
-            "general guidance instead of a fabricated one.\n"
+            "names, or dates that were not given to you in this conversation or by a "
+            "tool. If you don't have a real figure, say so plainly and give general "
+            "guidance instead of a fabricated one.\n"
             "- If you're not sure about something, say you're not sure rather than "
             "guessing confidently."
         )
 
-        # How to use live data blocks (see _get_market_context / _get_weather_context
-        # below) that get prepended to the user's message for market/weather questions.
+        # Tools (see chat_tools.py). The model decides when to call them, in
+        # any language, with the conversation in view - so follow-ups like
+        # "and tomorrow?" after a weather question still get real data.
         self.general_system_prompt += (
-            "\n\nSometimes a message will include a block starting with '[LIVE DATA'. "
-            "That block contains real, current figures fetched moments ago from a real "
-            "data source (Agmarknet for market prices, OpenWeather for weather). Treat "
-            "those numbers as ground truth - build your quantitative answer on them rather "
-            "than estimating your own, and briefly mention the source (e.g. 'per Agmarknet' "
-            "or 'per OpenWeather') so the user knows it's live data, not a guess. If the "
-            "block says no data was found, say so plainly instead of inventing figures."
+            "\n\nYou have tools that fetch real, current data. Use them instead of answering "
+            "from memory whenever they apply - including for follow-up questions:\n"
+            "- get_market_prices: any question about a crop's price, rate, bhav, MSP, or whether to sell.\n"
+            "- get_weather_forecast: weather, rain, temperature, and timing decisions (spraying, "
+            "irrigation, sowing, harvesting). Base timing advice on the actual daily forecast.\n"
+            "- estimate_yield_and_income: when the user asks how much they'll harvest or earn. If "
+            "you don't know their crop, land area, or state yet, ask for them first (one short "
+            "question), then call it.\n"
+            "- search_web: current government schemes/subsidies, regulations, outbreaks, or news.\n"
+            "Always pass tool arguments in English, whatever language the user writes in. Treat "
+            "tool results as ground truth, quote their figures as given, and briefly name the "
+            "source (e.g. 'per Agmarknet', 'per Open-Meteo', 'per CropIQ's yield model'). Market "
+            "prices are all-India averages, not a specific local mandi - say so. If a tool returns "
+            "an error or no data, say so plainly instead of inventing figures."
+        )
+
+        # Suggested next questions, shown as tappable chips under the answer.
+        # Split off by _split_followups before the text is shown or stored.
+        self.general_system_prompt += (
+            "\n\nAt the very end of every reply, add one final line in exactly this format:\n"
+            "FOLLOWUPS: <question 1> | <question 2> | <question 3>\n"
+            "with 2-3 short questions (under 10 words each) the farmer would naturally ask you "
+            "next, written from the farmer's point of view, in the same language as your reply. "
+            "Skip the line only for greetings or when you declined an off-topic question."
         )
 
         # Extra-strict rule for the two categories where a confident-but-wrong
@@ -200,8 +228,8 @@ class ChatAgent(Agent):
             "memory. Describe the general approach instead, and tell the user to "
             "confirm the precise figure with their local Krishi Vigyan Kendra, "
             "agriculture extension officer, or the scheme's official page - unless "
-            "that exact figure was given to you in this conversation, a [LIVE DATA] "
-            "block, or a search result you're citing."
+            "that exact figure was given to you in this conversation, by a tool, or in "
+            "a search result you're citing."
         )
 
         # How to treat retrieved KCC archive material. Worth stating explicitly:
@@ -212,12 +240,11 @@ class ChatAgent(Agent):
             "\n\nIf a [REFERENCE] block of past Kisan Call Centre answers is provided, "
             "treat it as real expert practice from India's national farmer helpline "
             "archive - it's a genuine reference point, not a guess. If the user's "
-            "location is known (given earlier in the message as 'Location: ...'), use "
-            "it: adapt region-specific details like sowing dates, varieties, or local "
-            "practices to what actually fits that location, rather than repeating the "
-            "archived answer's specifics if they were logged from elsewhere in India. "
-            "If the user's location isn't known, answer generally and suggest they "
-            "share their location or district for advice tailored to their area. "
+            "location is known, use it: adapt region-specific details like sowing dates, "
+            "varieties, or local practices to what actually fits that location, rather "
+            "than repeating the archived answer's specifics if they were logged from "
+            "elsewhere in India. If the user's location isn't known, answer generally and "
+            "suggest they share their location or district for advice tailored to their area. "
             "Regardless of location, treat dosages, chemical names, and amounts from "
             "the archive as unverified - describe the general approach and tell the "
             "user to confirm the exact figure locally or against a current source, "
@@ -235,7 +262,7 @@ class ChatAgent(Agent):
         # open Gemma model), only ever tried if both the primary and
         # fallback models above are exhausted. Unset by default.
         self.safety_net_model_name = settings.GEMINI_SAFETY_NET_MODEL or None
-        
+
     def _init_ai_models(self):
         """Initialize the AI models for chat"""
         self.gemini_client = None
@@ -256,9 +283,8 @@ class ChatAgent(Agent):
             logger.warning("Gemini API key not configured; chat will use fallback responses")
 
         # KCC archive (RAG) via Upstash Vector - optional, same "degrade
-        # gracefully" treatment as everything else here. If unset, general
-        # farming-advice questions just skip archive grounding and fall
-        # through to search-grounded/plain answers as before.
+        # gracefully" treatment as everything else here. If unset, farming-
+        # advice questions just skip archive grounding.
         self.kcc_index = None
         if UpstashVectorIndex and settings.UPSTASH_VECTOR_REST_URL and settings.UPSTASH_VECTOR_REST_TOKEN:
             try:
@@ -272,24 +298,6 @@ class ChatAgent(Agent):
                 self.kcc_index = None
         else:
             logger.info("Upstash Vector not configured; chat will skip KCC-archive grounding")
-    
-    async def _classify_query(self, user_message: str) -> tuple:
-        """Decide which live data source (if any) this message needs.
-
-        NOTE: this previously made a separate forced-function-call Gemini
-        request to classify intent (to catch paraphrases like "what will I
-        get for my onions" that keyword matching misses). That doubled
-        Gemini API usage on every single chat message - one call to
-        classify, one to answer - which caused quota exhaustion in
-        production on the very first message of the day. Reverted to plain
-        keyword/regex matching, which costs zero extra API calls. If this
-        gets revisited, the right fix is folding classification into the
-        SAME generation call (via function declarations the model can
-        choose to invoke inline) rather than a separate preceding call -
-        but that needs to be verified against the live API first, not
-        shipped speculatively.
-        """
-        return _detect_intent(user_message), _extract_crop(user_message)
 
     async def handle_chat(self, message: Message) -> Optional[Message]:
         """
@@ -305,101 +313,87 @@ class ChatAgent(Agent):
                     content={"error": "No message provided"},
                     message_type="error"
                 )
-            
+
             # Get session ID from context
             session_id = message.context.get("session_id") if message.context else None
             if not session_id:
                 logger.warning("No session ID provided for chat")
                 session_id = "default_session"
-            
-            # Get chat history from context
+
             chat_history = await self._get_chat_history(session_id)
 
-            original_message = user_message
-
-            # If a session-level location is stored (e.g., auto-enabled), include it in the prompt
-            location = None
-            latitude = None
-            longitude = None
+            # Location and language: explicit per-message values win over
+            # whatever is stored for the session.
+            location = latitude = longitude = None
             language = "en"
             try:
                 session_ctx = context_protocol.get_context(session_id) or {}
                 if isinstance(session_ctx, dict):
-                    # common keys: 'location' or 'auto_location'
                     location = session_ctx.get('location') or session_ctx.get('auto_location')
                     latitude = session_ctx.get('latitude')
                     longitude = session_ctx.get('longitude')
                     language = session_ctx.get('language') or language
-                # Also check incoming message context for explicit location
                 if message.context:
-                    location = location or message.context.get('location')
-                    latitude = latitude or message.context.get('latitude')
-                    longitude = longitude or message.context.get('longitude')
+                    location = message.context.get('location') or location
+                    latitude = message.context.get('latitude') if message.context.get('latitude') is not None else latitude
+                    longitude = message.context.get('longitude') if message.context.get('longitude') is not None else longitude
                     language = message.context.get('language') or language
-                if location:
-                    # Prepend a short location context so the assistant uses local climatic info
-                    user_message = f"Location: {location}. Consider local climatic conditions when answering.\nUser: {user_message}"
             except Exception:
                 # don't fail chat if context lookup errors
                 pass
+            # "hi-IN" (voice) and "hi" (text chat) mean the same thing here
+            language = (language or "en").split("-")[0].lower()
+            user_ctx = {"location": location, "latitude": latitude, "longitude": longitude}
 
-            # Intent-aware grounding: for market/weather questions, fetch real
-            # data first and hand it to Gemini as a labeled block rather than
-            # letting the model guess prices or forecasts on its own. For
-            # anything else, let Gemini ground itself with a live Google
-            # Search instead of answering purely from training memory.
-            intent = "general"
-            live_data_block = None
+            # Background grounding from the KCC archive (how real helpline
+            # experts answered similar questions). Only added to this turn's
+            # model input - never stored in history, so it can't go stale or
+            # pile up across turns.
+            model_input = user_message
+            rag_sources: List[Dict[str, Any]] = []
             try:
-                intent, crop_hint = await self._classify_query(original_message)
-                if intent == "market":
-                    live_data_block = await self._get_market_context(original_message, crop_hint=crop_hint)
-                elif intent == "weather":
-                    live_data_block = await self._get_weather_context(location, latitude, longitude)
-                else:
-                    # General farming-advice questions (pest/disease/practice/
-                    # scheme queries) get background grounding from the KCC
-                    # archive, on top of the live Google Search Gemini already
-                    # does for "general" below - the two are complementary,
-                    # not exclusive: search finds current info, the archive
-                    # finds how real KCC experts have answered similar
-                    # questions before.
-                    kcc_block = await self._get_kcc_reference_context(original_message)
-                    if kcc_block:
-                        user_message = f"{kcc_block}\n\n{user_message}"
-                if live_data_block:
-                    user_message = f"{live_data_block}\n\n{user_message}"
+                kcc_result = await self._get_kcc_reference_context(user_message)
+                if kcc_result:
+                    kcc_block, rag_sources = kcc_result
+                    model_input = f"{kcc_block}\n\n{user_message}"
             except Exception as e:
-                # Live-data grounding is a bonus, not a requirement - if it
-                # fails for any reason, fall through to a plain Gemini answer
-                # rather than breaking the chat turn.
-                logger.warning(f"Live-data grounding skipped due to error: {e}")
+                logger.warning(f"KCC grounding skipped due to error: {e}")
 
-            # Use Gemini when available; otherwise provide a helpful fallback response.
+            tool_log: List[Dict[str, Any]] = []
+            model_ok = False
+            suggestions: List[str] = []
             if self.gemini_client:
-                response = await self._chat_with_gemini(
-                    user_message, chat_history, use_search=(intent == "general"), language=language
+                response, tool_log, model_ok = await self._chat_with_gemini(
+                    model_input, chat_history, user_ctx, language=language
                 )
-                if live_data_block:
-                    # Only cross-check when we actually handed the model a
-                    # ground-truth block to be graded against - search-grounded
-                    # general answers legitimately cite figures (e.g. scheme
-                    # amounts) that won't appear verbatim in any block here.
-                    response = _flag_unverified_numbers(response, live_data_block)
+                if model_ok:
+                    response, suggestions = _split_followups(response)
+                data_text = " ".join(
+                    json.dumps(t["result"], ensure_ascii=False)
+                    for t in tool_log if t["name"] in chat_tools.TOOL_PROVIDERS
+                )
+                if model_ok and data_text:
+                    # Only cross-check when real data was fetched to grade
+                    # against - plain advice answers have nothing to compare to.
+                    response = _flag_unverified_numbers(response, data_text + " " + user_message)
             else:
                 response = self._fallback_response(user_message, not_configured=True)
-            
-            # Update chat history in context
-            await self._update_chat_history(session_id, user_message, response)
-            
+
+            source_info = self._build_source_info(rag_sources, tool_log, model_ok)
+
+            # Store what the user actually typed, not the model input with
+            # reference blocks - and only real answers, not error text.
+            if model_ok:
+                await self._update_chat_history(session_id, user_message, response)
+
             return Message(
                 sender=self.agent_type,
                 receiver=message.sender,
-                content={"response": response},
+                content={"response": response, "sources": source_info, "suggestions": suggestions},
                 message_type="chat_response",
                 context=message.context
             )
-                
+
         except Exception as e:
             logger.error(f"Error in chat handler: {e}")
             return Message(
@@ -408,7 +402,7 @@ class ChatAgent(Agent):
                 content={"error": f"Error processing chat: {str(e)}"},
                 message_type="error"
             )
-    
+
     async def handle_stream_chat(self, message: Message) -> Optional[Message]:
         """
         Handle a streaming chat message from the user
@@ -416,127 +410,12 @@ class ChatAgent(Agent):
         # This is just a placeholder - in a real implementation
         # this would use the streaming capabilities of Gemini
         return await self.handle_chat(message)
-    
-    async def _get_market_context(self, user_message: str, crop_hint: Optional[str] = None) -> Optional[str]:
-        """Fetch real market prices relevant to the question and format them
-        as a labeled block for Gemini to reason over, instead of asking
-        Gemini to recall or guess prices from its training data.
 
-        Tries the live Agmarknet call first (freshest, but can fail - rate
-        limits, transient outages, or the endpoint blocking a given
-        server's IP). Falls back to the Redis-backed daily snapshot log
-        (the same store the trend chart reads from, kept current by the
-        /market/cron/refresh-snapshot job) so a live-request hiccup doesn't
-        mean the assistant has no real numbers at all.
-        """
-        # Prefer the crop the classifier already extracted (handles
-        # paraphrases/multi-word names) and only fall back to the plain
-        # regex if the classifier didn't return one.
-        crop = crop_hint or _extract_crop(user_message)
-        records = []
-        try:
-            if crop:
-                scraper = get_scraper("agmarknet")
-                records = await scraper.get_prices(crop)
-            else:
-                # No specific crop mentioned - give a small general snapshot
-                records = (await get_all_prices())[:8]
-        except Exception as e:
-            logger.warning(f"Live Agmarknet fetch failed for chat, will try Redis snapshot: {e}")
-            records = []
-
-        if records:
-            lines = []
-            for r in records[:8]:
-                price = r.get("price_per_quintal")
-                if price is None:
-                    continue
-                change = r.get("price_change_pct")
-                change_str = f", {change:+.1f}% vs yesterday" if change is not None else ""
-                msp = r.get("msp_price")
-                msp_str = f", MSP ₹{msp:.0f}/quintal" if msp else ""
-                lines.append(f"- {r.get('crop')}: ₹{price:.0f}/quintal{change_str}{msp_str} (as of {r.get('date')})")
-            if lines:
-                return "[LIVE DATA: market, source=Agmarknet]\n" + "\n".join(lines)
-
-        # Live fetch came back empty or failed - fall back to the last
-        # snapshot we already have cached in Redis.
-        try:
-            snapshot = await get_latest_snapshot()
-        except Exception as e:
-            logger.error(f"Redis snapshot fallback also failed for chat: {e}")
-            snapshot = None
-
-        if not snapshot:
-            target = crop or "that commodity"
-            return (
-                f"[LIVE DATA: market] No current Agmarknet listing and no cached snapshot found for {target} - "
-                "answer cautiously and say prices should be confirmed locally."
-            )
-
-        prices = snapshot["prices"]
-        if crop:
-            matches = {name: p for name, p in prices.items() if crop.lower() in name.lower()}
-        else:
-            matches = dict(list(prices.items())[:8])
-
-        if not matches:
-            target = crop or "that commodity"
-            return (
-                f"[LIVE DATA: market] No cached price found for {target} either - "
-                "answer cautiously and say prices should be confirmed locally."
-            )
-
-        lines = [f"- {name}: ₹{price:.0f}/quintal" for name, price in matches.items()]
-        return (
-            f"[LIVE DATA: market, source=Agmarknet (cached snapshot from {snapshot['date']}, "
-            "today's live request failed)]\n" + "\n".join(lines)
-        )
-
-    async def _get_weather_context(
-        self, location: Optional[str], latitude: Optional[float], longitude: Optional[float]
-    ) -> Optional[str]:
-        """Fetch real current conditions + a short-range rainfall estimate
-        from OpenWeather and format them as a labeled block for Gemini,
-        instead of asking Gemini to guess a forecast."""
-        lat, lon = latitude, longitude
-        try:
-            if lat is None or lon is None:
-                if not location:
-                    return (
-                        "[LIVE DATA: weather] No location is set for this chat, so no live "
-                        "forecast could be fetched - ask the user for their village/district/state."
-                    )
-                geo = await asyncio.to_thread(get_geocode_data, location)
-                if not geo:
-                    return f"[LIVE DATA: weather] Could not resolve the location '{location}' to fetch a live forecast."
-                lat, lon = geo.get("lat"), geo.get("lon")
-
-            weather = await asyncio.to_thread(get_weather_data, lat, lon)
-        except Exception as e:
-            logger.error(f"Error fetching live weather data for chat: {e}")
-            return "[LIVE DATA: weather] Could not reach OpenWeather right now - answer from general seasonal knowledge and flag that it isn't a live forecast."
-
-        if not weather:
-            return "[LIVE DATA: weather] OpenWeather returned no data for this location right now."
-
-        where = f" near {location}" if location else ""
-        return (
-            f"[LIVE DATA: weather, source=OpenWeather{where}]\n"
-            f"- Current temperature: {weather['current_temp']}°C\n"
-            f"- Current humidity: {weather['current_humidity']}%\n"
-            f"- Current conditions: {weather['current_conditions']}\n"
-            f"- Estimated rainfall over the next month (from 5-day forecast trend): "
-            f"{weather['monthly_rainfall_estimate']:.1f} cm"
-        )
-
-    async def _get_kcc_reference_context(self, user_message: str) -> Optional[str]:
+    async def _get_kcc_reference_context(self, user_message: str) -> Optional[Tuple[str, List[Dict[str, Any]]]]:
         """Retrieve similar past Kisan Call Centre expert Q&A pairs from
-        Upstash Vector, for background grounding on general farming-advice
-        questions (pest/disease/practice/scheme queries that aren't live
-        market or weather questions).
+        Upstash Vector, for background grounding on farming-advice questions.
 
-        Deliberately labeled [REFERENCE], not [LIVE DATA]: this is historical
+        Deliberately labeled [REFERENCE], not live data: this is historical
         call-log data from the Kisan Call Centre archive - India's national
         farmer helpline program (circa 2015-2021) - not a live or
         verified-current source. The system prompt tells the model to treat
@@ -563,10 +442,10 @@ class ChatAgent(Agent):
             logger.warning(f"KCC archive lookup failed, skipping: {e}")
             return None
 
-        # Score threshold is a rough starting point, not a tuned value - I
-        # can't call the live Upstash index from this environment to
-        # calibrate it against real query traffic, so watch actual retrieval
-        # quality once this is live and adjust if it's too strict/loose.
+        # Score threshold is a rough starting point, not a tuned value -
+        # watch actual retrieval quality and adjust if it's too strict/loose.
+        # It also keeps price/weather questions from dragging in unrelated
+        # archive entries, now that every message is looked up.
         matches = [r for r in (results or []) if r.score is not None and r.score >= 0.80]
         if not matches:
             return None
@@ -580,66 +459,116 @@ class ChatAgent(Agent):
             "location - describe the approach and tell the user to confirm the exact "
             "figure locally.]"
         ]
+        sources: List[Dict[str, Any]] = []
         for i, m in enumerate(matches, 1):
             past_question = m.data or ""
-            past_answer = (m.metadata or {}).get("answer", "")
+            meta = m.metadata or {}
+            past_answer = meta.get("answer", "")
             if past_question and past_answer:
                 lines.append(f"{i}. Past Q: \"{past_question}\" -> Past A: \"{past_answer}\"")
-        if len(lines) == 1:
+                # Structured copy of what was retrieved, so the UI can show
+                # the user exactly which archive entries backed the answer.
+                sources.append({
+                    "title": past_question,
+                    "snippet": past_answer if len(past_answer) <= 220 else past_answer[:217].rstrip() + "...",
+                    "crop": meta.get("crop"),
+                    "score": round(float(m.score), 2),
+                })
+        if not sources:
             return None
-        return "\n".join(lines)
+        return "\n".join(lines), sources
 
-    def _append_grounding_sources(self, text: str, response) -> str:
-        """When Gemini used Google Search grounding, append the real source
-        links it cited - shows the user this wasn't answered from memory,
-        and gives them somewhere to double-check it."""
+    @staticmethod
+    def _build_source_info(
+        rag_sources: List[Dict[str, Any]],
+        tool_log: List[Dict[str, Any]],
+        model_ok: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """Decide what provenance label the UI shows under the answer.
+
+        Priority: RAG (KCC archive had relevant matches) -> live data the
+        tools actually fetched -> Gemini (with web citations, if it searched).
+        No label at all if the model never answered (error/fallback text
+        isn't "from" anything)."""
+        if not model_ok:
+            return None
+        web: List[Dict[str, Any]] = []
+        providers: List[str] = []
+        for call in tool_log:
+            result = call["result"] or {}
+            if call["name"] == "search_web":
+                web.extend(s for s in result.get("sources", []) if s not in web)
+            elif call["name"] in chat_tools.TOOL_PROVIDERS and "error" not in result and result.get("found", True):
+                provider = chat_tools.TOOL_PROVIDERS[call["name"]]
+                if provider not in providers:
+                    providers.append(provider)
+
+        if rag_sources:
+            extra = providers or (["Gemini"] if web else [])
+            return {
+                "type": "rag",
+                "label": " + ".join(["From RAG"] + extra),
+                "citations": rag_sources,
+                "web": web,
+            }
+        if providers:
+            return {"type": "live_data", "label": "From " + " + ".join(providers), "citations": [], "web": web}
+        return {"type": "gemini", "label": "From Gemini", "citations": [], "web": web}
+
+    async def _run_tool(self, call, user_ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute one function call requested by the model."""
+        args = dict(call.args or {})
         try:
-            candidate = response.candidates[0] if response.candidates else None
-            metadata = getattr(candidate, "grounding_metadata", None) if candidate else None
-            chunks = getattr(metadata, "grounding_chunks", None) if metadata else None
-            if not chunks:
-                return text
-            seen = set()
-            links = []
-            for chunk in chunks:
-                web = getattr(chunk, "web", None)
-                if web and web.uri and web.uri not in seen:
-                    seen.add(web.uri)
-                    links.append(f"- [{web.title or web.domain or web.uri}]({web.uri})")
-                if len(links) >= 4:
-                    break
-            if links:
-                return f"{text}\n\n**Sources:**\n" + "\n".join(links)
+            if call.name == "get_market_prices":
+                return await chat_tools.get_market_prices(args.get("commodity", ""))
+            if call.name == "get_weather_forecast":
+                return await chat_tools.get_weather_forecast(
+                    user_ctx.get("latitude"), user_ctx.get("longitude"), user_ctx.get("location"),
+                    place=args.get("place"),
+                )
+            if call.name == "estimate_yield_and_income":
+                return await chat_tools.estimate_yield_and_income(
+                    crop=args.get("crop"), area=float(args.get("area") or 0), state=args.get("state"),
+                    area_unit=args.get("area_unit") or "acres", district=args.get("district"),
+                    season=args.get("season"),
+                    latitude=user_ctx.get("latitude"), longitude=user_ctx.get("longitude"),
+                )
+            if call.name == "search_web":
+                return await chat_tools.search_web(self.gemini_client, self.gemini_model_name, args.get("query", ""))
         except Exception as e:
-            logger.warning(f"Could not extract grounding sources: {e}")
-        return text
+            logger.exception(f"Chat tool {call.name} failed")
+            return {"error": f"The {call.name} tool failed ({type(e).__name__})."}
+        return {"error": f"Unknown tool {call.name}"}
 
     async def _chat_with_gemini(
         self,
         user_message: str,
         chat_history: List[Dict[str, Any]],
-        use_search: bool = False,
+        user_ctx: Dict[str, Any],
         language: str = "en",
-    ) -> str:
-        """Generate a response using Gemini, with retry-with-backoff and a
-        fallback model if the primary model is transiently overloaded.
-
-        This reliability path used to exist only on the old CropDoctorAgent;
-        it's now the one path every chat message goes through, regardless of
-        topic.
-        """
-        # Convert chat history to Gemini format - actual prior turns only.
-        # The system prompt is NOT stuffed in here as a fake first turn
-        # (that approach silently drops out of context after the first
-        # message, since only real turns get persisted to chat_history).
-        # It's passed as a proper system_instruction below instead, so it
-        # stays in effect for every turn of the whole conversation.
-        gemini_chat = []
-        for message in chat_history:
-            role = "user" if message["role"] == "user" else "model"
-            gemini_chat.append({"role": role, "parts": [{"text": message["content"]}]})
+    ) -> Tuple[str, List[Dict[str, Any]], bool]:
+        """Generate a response using Gemini with tool calling, retry-with-
+        backoff, and fallback models if the primary is overloaded.
+        Returns (text, tool_log, model_ok)."""
+        # Prior turns only. The system prompt is passed as a proper
+        # system_instruction so it stays in effect for every turn.
+        history_contents = [
+            types.Content(role="user" if m["role"] == "user" else "model", parts=[types.Part(text=m["content"])])
+            for m in chat_history
+        ]
 
         system_instruction = self.general_system_prompt
+        if user_ctx.get("location") or user_ctx.get("latitude") is not None:
+            where = user_ctx.get("location") or f"{user_ctx['latitude']:.3f}, {user_ctx['longitude']:.3f}"
+            system_instruction += (
+                f"\n\nThe user's location: {where}. Consider local climatic conditions when answering, "
+                "and use it for weather and yield questions unless they name another place."
+            )
+        else:
+            system_instruction += (
+                "\n\nThe user hasn't shared a location. For weather, timing or region-specific questions, "
+                "ask for their district and state."
+            )
         if language and language != "en":
             lang_name = _LANGUAGE_NAMES.get(language, language)
             system_instruction += (
@@ -648,22 +577,9 @@ class ChatAgent(Agent):
                 f"different language."
             )
 
-        def _build_config(allow_search: bool) -> dict:
-            cfg = {
-                "system_instruction": system_instruction,
-                # Lower than Gemini's ~1.0 default - factual farming
-                # advice should stay close to what the model
-                # actually knows rather than getting creative.
-                "temperature": 0.3,
-            }
-            if use_search and allow_search:
-                # Market and weather questions already get grounded in real
-                # Agmarknet/OpenWeather data above - this covers everything
-                # else (government schemes, general agri knowledge, current
-                # events) by letting Gemini search the live web instead of
-                # answering purely from training memory.
-                cfg["tools"] = [{"google_search": {}}]
-            return cfg
+        # Tool results cached per request, so a retry or fallback model
+        # doesn't refetch the same prices/forecast.
+        tool_cache: Dict[str, Dict[str, Any]] = {}
 
         def _classify_error(err_str: str) -> str:
             """Distinguish a hard quota cap (won't recover for hours - retrying
@@ -676,21 +592,52 @@ class ChatAgent(Agent):
                 return "rate_limited"
             return "other"
 
-        async def _send_with_retries(model_name: str, max_retries: int = 1, allow_search: bool = True) -> str:
-            call_config = _build_config(allow_search)
+        async def _generate(model_name: str, allow_tools: bool) -> Tuple[str, List[Dict[str, Any]], bool]:
+            """One full answer: model call, any tool calls it asks for, repeat."""
+            contents = history_contents + [types.Content(role="user", parts=[types.Part(text=user_message)])]
+            tool_log: List[Dict[str, Any]] = []
+            for round_no in range(MAX_TOOL_ROUNDS + 1):
+                # Last round: force a text answer from what's been gathered
+                tools_now = allow_tools and round_no < MAX_TOOL_ROUNDS
+                config = types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    # Lower than Gemini's ~1.0 default - factual farming
+                    # advice should stay close to what the model knows.
+                    temperature=0.3,
+                    tools=[chat_tools.TOOL_DECLARATIONS] if tools_now else None,
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True) if tools_now else None,
+                )
+                response = await asyncio.to_thread(
+                    self.gemini_client.models.generate_content,
+                    model=model_name, contents=contents, config=config,
+                )
+                candidate = response.candidates[0] if response.candidates else None
+                parts = (candidate.content.parts if candidate and candidate.content else None) or []
+                calls = [p.function_call for p in parts if p.function_call]
+                if not calls:
+                    text = "".join(p.text for p in parts if p.text) or (response.text or "")
+                    return text.strip() or "(No response)", tool_log, True
+
+                contents.append(candidate.content)
+                results = []
+                for call in calls:
+                    key = f"{call.name}:{json.dumps(dict(call.args or {}), sort_keys=True)}"
+                    if key not in tool_cache:
+                        tool_cache[key] = await self._run_tool(call, user_ctx)
+                    results.append(tool_cache[key])
+                    tool_log.append({"name": call.name, "args": dict(call.args or {}), "result": tool_cache[key]})
+                    logger.info(f"chat tool {call.name}({dict(call.args or {})})")
+                contents.append(types.Content(role="user", parts=[
+                    types.Part.from_function_response(name=call.name, response={"result": result})
+                    for call, result in zip(calls, results)
+                ]))
+            return "(No response)", tool_log, True
+
+        async def _send_with_retries(model_name: str, max_retries: int = 1, allow_tools: bool = True):
             last_exc = None
             for attempt in range(1, max_retries + 1):
                 try:
-                    chat = self.gemini_client.chats.create(
-                        model=model_name,
-                        history=gemini_chat,
-                        config=call_config,
-                    )
-                    response = await asyncio.to_thread(chat.send_message, user_message)
-                    text = getattr(response, "text", None) or (
-                        response.candidates[0].content if response.candidates else str(response)
-                    )
-                    return self._append_grounding_sources(text, response) if (use_search and allow_search) else text
+                    return await _generate(model_name, allow_tools)
                 except Exception as e:
                     last_exc = e
                     category = _classify_error(str(e))
@@ -698,9 +645,8 @@ class ChatAgent(Agent):
                         raise
                     if category == "quota_exhausted":
                         # A daily/monthly cap won't clear up in the next few
-                        # seconds - burning 3 retries here just adds latency
-                        # for no benefit. Fail fast so the caller can move on
-                        # to the fallback model (which may have separate quota).
+                        # seconds - fail fast so the caller can move on to the
+                        # fallback model (which may have separate quota).
                         logger.error(f"chat_assistant {model_name} quota exhausted, not retrying: {e}")
                         raise
                     if attempt < max_retries:
@@ -712,47 +658,34 @@ class ChatAgent(Agent):
             raise last_exc
 
         try:
-            # Only 2 attempts (1 retry) on the primary, not 3 - with two
-            # more independently-quota'd tiers below to fall through to,
-            # hammering the same possibly-overloaded model repeatedly just
-            # adds latency for little extra benefit.
+            # Only 2 attempts (1 retry) on the primary - with two more
+            # independently-quota'd tiers below to fall through to,
+            # hammering the same possibly-overloaded model just adds latency.
             return await _send_with_retries(self.gemini_model_name, max_retries=2)
         except Exception as e1:
             category = _classify_error(str(e1))
             logger.warning(f"chat_assistant primary model failed: {e1} (category={category})")
             if category not in ("quota_exhausted", "rate_limited"):
                 logger.error(f"chat_assistant non-retryable error: {e1}")
-                return self._fallback_response(user_message, error=str(e1))
+                return self._fallback_response(user_message, error=str(e1)), [], False
 
             try:
-                # Only one attempt on the fallback model, not a full retry
-                # loop - if the primary is quota-exhausted or rate
-                # limited, hammering the fallback 3x too just adds delay.
-                return await _send_with_retries(
-                    self.fallback_model_name,
-                    max_retries=1,
-                    allow_search=False,
-                )
+                return await _send_with_retries(self.fallback_model_name, max_retries=1)
             except Exception as e2:
                 category2 = _classify_error(str(e2))
                 logger.warning(f"chat_assistant fallback model failed: {e2} (category={category2})")
                 if not self.safety_net_model_name or category2 not in ("quota_exhausted", "rate_limited"):
                     logger.error(f"chat_assistant fallback model also failed: {e2}")
-                    return self._fallback_response(user_message, error=str(e2))
+                    return self._fallback_response(user_message, error=str(e2)), [], False
 
                 try:
                     # Third tier - a separate, much-higher-daily-quota model.
-                    # Only reached once both the primary and fallback tiers
-                    # above have genuinely run out of quota, not just failed
-                    # for some other reason. Search grounding is skipped
-                    # here (allow_search=False): the safety-net model is
-                    # typically an open Gemma model, which doesn't support
-                    # Gemini's Search grounding tool - requesting it would
-                    # just add a guaranteed-failing, guaranteed-slow call.
-                    return await _send_with_retries(self.safety_net_model_name, max_retries=1, allow_search=False)
+                    # Tools are skipped here: the safety-net model is
+                    # typically an open Gemma model without function calling.
+                    return await _send_with_retries(self.safety_net_model_name, max_retries=1, allow_tools=False)
                 except Exception as e3:
                     logger.error(f"chat_assistant safety-net model also failed: {e3}")
-                    return self._fallback_response(user_message, error=str(e3))
+                    return self._fallback_response(user_message, error=str(e3)), [], False
 
     def _fallback_response(self, user_message: str, error: Optional[str] = None, not_configured: bool = False) -> str:
         """Plain, honest message when the AI service can't be reached.
@@ -771,39 +704,43 @@ class ChatAgent(Agent):
         if not_configured:
             return "The assistant isn't set up yet. Please check back later."
         return "Sorry, I'm unable to respond right now. Please try again in a little while."
-    
+
     async def _get_chat_history(self, session_id: str) -> List[Dict[str, Any]]:
         """Get chat history from context"""
-        chat_history_key = f"chat_history_{session_id}"
-        chat_history = context_protocol.get_context(chat_history_key)
-        return chat_history or []
-    
+        return context_protocol.get_context(f"chat_history_{session_id}") or []
+
     async def _update_chat_history(self, session_id: str, user_message: str, ai_response: str):
-        """Update chat history in context"""
+        """Append one exchange to the session's history (wall-clock timestamps)."""
         chat_history_key = f"chat_history_{session_id}"
         chat_history = context_protocol.get_context(chat_history_key) or []
-        
-        # Add user message
-        chat_history.append({
-            "role": "user",
-            "content": user_message,
-            "timestamp": asyncio.get_event_loop().time()
-        })
-        
-        # Add AI response
-        chat_history.append({
-            "role": "assistant",
-            "content": ai_response,
-            "timestamp": asyncio.get_event_loop().time()
-        })
-        
-        # Limit history length to prevent context overflow
-        # Keep the most recent 30 messages (15 exchanges)
-        if len(chat_history) > 30:
-            chat_history = chat_history[-30:]
-        
-        # Update context
-        context_protocol.set_context(chat_history_key, chat_history)
+        now = time.time()
+        chat_history.append({"role": "user", "content": user_message, "timestamp": now})
+        chat_history.append({"role": "assistant", "content": ai_response, "timestamp": now})
+        # Keep the most recent messages to prevent context overflow
+        context_protocol.set_context(chat_history_key, chat_history[-MAX_HISTORY_MESSAGES:])
+
+
+def seed_history_if_missing(session_id: str, client_history: Optional[List[Dict[str, Any]]]) -> None:
+    """If the server has no history for this session (e.g. the backend
+    restarted or the free-tier host slept), rebuild it from the copy the
+    browser sends with every message, so the assistant doesn't silently
+    forget the conversation."""
+    key = f"chat_history_{session_id}"
+    if context_protocol.get_context(key) or not client_history:
+        return
+    now = time.time()
+    cleaned = [
+        {"role": m["role"], "content": m["content"][:4000], "timestamp": now}
+        for m in client_history
+        if isinstance(m, dict) and m.get("role") in ("user", "assistant")
+        and isinstance(m.get("content"), str) and m["content"].strip()
+    ]
+    # Gemini expects the conversation to start with a user turn
+    while cleaned and cleaned[0]["role"] != "user":
+        cleaned.pop(0)
+    if cleaned:
+        context_protocol.set_context(key, cleaned[-MAX_HISTORY_MESSAGES:])
+
 
 # Function to create and register the chat agent
 def init_chat_agent():

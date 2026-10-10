@@ -3,20 +3,20 @@ import pandas as pd
 import joblib
 import difflib
 from typing import Dict, List, Tuple, Optional
-import random
+import re
 import requests
 import os
 from datetime import datetime, timedelta
 from app.models.yield_model import YieldInput
 from app.core.config import get_settings
+from app.services import agronomy
 
 # Load settings
 settings = get_settings()
 
 # --- Trained ML model (see app/models/train_yield_model.py) ---
-# Predicts tonnes/hectare from State, District, Crop, Crop Type, Season,
-# Area and Year, trained on real government crop-wise area/production/yield
-# records. Falls back to the coefficient-based heuristic below for crops
+# Predicts tonnes/hectare from State, District, Crop and Season, trained on
+# real government crop-wise area/production/yield records. Falls back to the coefficient-based heuristic below for crops
 # that aren't in the training data's vocabulary (e.g. aggregate categories
 # like "Other Vegetables"/"Total Foodgrains", or units the source data
 # reports inconsistently - see the Coconut note in the training script).
@@ -31,6 +31,8 @@ try:
     yield_model = XGBRegressor()
     yield_model.load_model(_YIELD_MODEL_PATH)  # native format: robust across machines/xgboost versions
     yield_meta = joblib.load(_YIELD_META_PATH)
+    if yield_meta.get("version", 1) < 2:
+        raise ValueError("model metadata is from an older training script - retrain the yield model")
     print(f"Loaded ML yield model (R2={yield_meta['metrics']['r2']:.3f}, "
           f"trained on {yield_meta['metrics']['n_train']} rows)")
 except FileNotFoundError:
@@ -71,6 +73,11 @@ CROP_HEURISTIC_ONLY = {"Other Pulses", "Other Vegetables", "Fruits", "Total Food
 GOOGLE_MAPS_API_KEY = os.getenv('GOOGLE_MAPS_API_KEY', settings.GOOGLE_MAPS_API_KEY if hasattr(settings, 'GOOGLE_MAPS_API_KEY') else None)
 OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY', settings.OPENWEATHER_API_KEY if hasattr(settings, 'OPENWEATHER_API_KEY') else None)
 
+# Outbound API calls must not hang a prediction request indefinitely.
+HTTP_TIMEOUT_S = 8
+
+ACRES_TO_HECTARES = 0.404686
+
 # Crop coefficients for yield calculation (simplified model)
 # These values represent the base yield potential for each crop in tons/hectare
 CROP_COEFFICIENTS = {
@@ -98,6 +105,34 @@ CROP_COEFFICIENTS = {
     "Fruits": 18.0,
     "Total Foodgrains": 3.5,
 }
+
+# Annual rainfall range (mm) within which each crop does well without a
+# rainfall penalty. Outside it the penalty grows gradually; it's kept mild
+# because much of Indian wheat, sugarcane, potato etc. is irrigated, so low
+# rainfall alone doesn't mean low yield.
+CROP_RAINFALL_RANGE_MM = {
+    "Rice": (1000, 2500),
+    "Jowar": (400, 1000),
+    "Bajra": (250, 800),
+    "Maize": (500, 1200),
+    "Ragi": (500, 1200),
+    "Wheat": (350, 1100),
+    "Gram": (350, 900),
+    "Tur": (600, 1400),
+    "Other Pulses": (400, 1000),
+    "Groundnut": (500, 1250),
+    "Sunflower": (400, 1000),
+    "Soyabean": (600, 1200),
+    "Safflower": (300, 800),
+    "Nigerseed": (800, 1500),
+    "Other Oilseeds": (400, 1000),
+    "Cotton": (500, 1200),
+    "Sugarcane": (1000, 2500),
+    "Tobacco": (500, 1200),
+    "Potato": (300, 1200),
+    "Onion": (350, 1000),
+}
+DEFAULT_RAINFALL_RANGE_MM = (500, 1500)
 
 # Season coefficients (multiplier effect)
 SEASON_COEFFICIENTS = {
@@ -136,6 +171,22 @@ STATE_COORDINATES = {
     "Tamil Nadu": {"lat": 11.1271, "lon": 78.6569},
     "Andhra Pradesh": {"lat": 15.9129, "lon": 79.7400},
     "Telangana": {"lat": 18.1124, "lon": 79.0193},
+    "Assam": {"lat": 26.2006, "lon": 92.9376},
+    "Chhattisgarh": {"lat": 21.2787, "lon": 81.8661},
+    "Goa": {"lat": 15.2993, "lon": 74.1240},
+    "Himachal Pradesh": {"lat": 31.1048, "lon": 77.1734},
+    "Jammu And Kashmir": {"lat": 33.7782, "lon": 76.5762},
+    "Jharkhand": {"lat": 23.6102, "lon": 85.2799},
+    "Kerala": {"lat": 10.8505, "lon": 76.2711},
+    "Manipur": {"lat": 24.6637, "lon": 93.9063},
+    "Meghalaya": {"lat": 25.4670, "lon": 91.3662},
+    "Mizoram": {"lat": 23.1645, "lon": 92.9376},
+    "Nagaland": {"lat": 26.1584, "lon": 94.5624},
+    "Odisha": {"lat": 20.9517, "lon": 85.0985},
+    "Rajasthan": {"lat": 27.0238, "lon": 74.2179},
+    "Sikkim": {"lat": 27.5330, "lon": 88.5122},
+    "Tripura": {"lat": 23.9408, "lon": 91.9882},
+    "Uttarakhand": {"lat": 30.0668, "lon": 79.0193},
 }
 
 # Crop-specific recommendations
@@ -211,8 +262,11 @@ def get_geocode_data(address: str) -> Optional[Dict]:
         return None
         
     try:
-        url = f"https://maps.googleapis.com/maps/api/geocode/json?address={address}&key={GOOGLE_MAPS_API_KEY}"
-        response = requests.get(url)
+        response = requests.get(
+            "https://maps.googleapis.com/maps/api/geocode/json",
+            params={"address": address, "key": GOOGLE_MAPS_API_KEY},
+            timeout=HTTP_TIMEOUT_S,
+        )
         data = response.json()
         
         if data['status'] == 'OK':
@@ -239,12 +293,12 @@ def get_weather_data(lat: float, lon: float) -> Optional[Dict]:
     try:
         # Current weather
         current_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&units=metric&appid={OPENWEATHER_API_KEY}"
-        current_response = requests.get(current_url)
+        current_response = requests.get(current_url, timeout=HTTP_TIMEOUT_S)
         current_data = current_response.json()
-        
+
         # 5-day forecast
         forecast_url = f"https://api.openweathermap.org/data/2.5/forecast?lat={lat}&lon={lon}&units=metric&appid={OPENWEATHER_API_KEY}"
-        forecast_response = requests.get(forecast_url)
+        forecast_response = requests.get(forecast_url, timeout=HTTP_TIMEOUT_S)
         forecast_data = forecast_response.json()
         
         # Process and return relevant weather data
@@ -279,20 +333,6 @@ def get_weather_data(lat: float, lon: float) -> Optional[Dict]:
         print(f"Error in weather data: {e}")
         return None
 
-def get_soil_data(lat: float, lon: float) -> Dict:
-    """
-    Get soil data based on location
-    Note: This is a placeholder. In a real implementation, this would connect to a soil database or API.
-    """
-    # For now, return default values with slight randomization to simulate real data
-    return {
-        'ph': round(random.uniform(6.0, 7.5), 1),
-        'n': round(random.uniform(120, 160)),
-        'p': round(random.uniform(40, 60)),
-        'k': round(random.uniform(180, 220)),
-        'organic_carbon': round(random.uniform(0.4, 0.8), 1)
-    }
-
 def get_weather_based_recommendations(weather_data: Dict) -> List[str]:
     """
     Generate weather-specific recommendations based on current conditions
@@ -319,8 +359,9 @@ def get_weather_based_recommendations(weather_data: Dict) -> List[str]:
         recommendations.append(WEATHER_RECOMMENDATIONS['heavy_rain'])
     elif weather_data['monthly_rainfall_estimate'] < 5:
         recommendations.append(WEATHER_RECOMMENDATIONS['drought'])
-        
+
     return recommendations
+
 
 def _resolve_category(value: str, valid_values: List[str], name_map: Optional[Dict[str, str]] = None,
                        cutoff: float = 0.75) -> Optional[str]:
@@ -347,21 +388,52 @@ def _resolve_category(value: str, valid_values: List[str], name_map: Optional[Di
     return close[0] if close else None
 
 
-def _encode_or_unseen(encoder, value: str) -> int:
-    """LabelEncoder.transform, but maps categories unseen during training to
-    a fixed fallback class instead of raising."""
-    if value in encoder.classes_:
-        return int(encoder.transform([value])[0])
-    return int(encoder.transform([encoder.classes_[0]])[0])
+def _normalize_place(name: str) -> str:
+    """'Ludhiana District' / 'ludhiana  dist.' -> 'ludhiana'."""
+    name = re.sub(r"\b(district|dist\.?|zila|zilla)\b", " ", name.lower())
+    return re.sub(r"[^a-z]+", " ", name).strip()
 
 
-def get_ml_yield_estimate(crop: str, state: str, season: str, area: float) -> Optional[Tuple[float, str]]:
+def _resolve_district(district: Optional[str], state: str) -> Optional[str]:
+    """Match a free-text district (e.g. from OSM reverse geocoding) to a
+    district the model was trained on, searching only within the given state.
+    Returns None when there's no confident match - the model then gives a
+    state-level estimate rather than borrowing some other district's pattern."""
+    if not district:
+        return None
+    candidates = yield_meta["state_districts"].get(state, [])
+    by_norm = {_normalize_place(d): d for d in candidates}
+    target = _normalize_place(district)
+    if target in by_norm:
+        return by_norm[target]
+    close = difflib.get_close_matches(target, list(by_norm), n=1, cutoff=0.8)
+    return by_norm[close[0]] if close else None
+
+
+def _resolve_season(crop: str, state: str, season: str) -> Tuple[str, Optional[str]]:
+    """Pick the season label the data actually records this crop under.
+    Some crops are only reported under seasons the form doesn't offer -
+    sugarcane is almost always "Whole Year" - and predicting them under
+    "Kharif" puts them in a corner of the data with few or no examples.
+    Returns (season, note) where note explains any substitution."""
+    resolved = _resolve_category(season, yield_meta["valid_seasons"])
+    known = yield_meta["crop_state_seasons"].get((crop, state)) or yield_meta["crop_seasons"].get(crop, [])
+    if resolved and (not known or resolved in known):
+        return resolved, None
+    if known:
+        note = (f"{crop} is recorded under the '{known[0]}' season in this region's data, "
+                f"so the estimate uses that instead of '{season}'.")
+        return known[0], note
+    return resolved or "Kharif", None
+
+
+def get_ml_yield_estimate(crop: str, state: str, season: str, district: Optional[str] = None) -> Optional[Dict]:
     """
     Predict tonnes/hectare using the trained XGBoost model
     (app/models/train_yield_model.py), if the model is loaded and the crop
-    can be matched to the training data's vocabulary.
-    Returns (yield_per_hectare, resolved_crop_name) or None to signal the
-    caller should use the heuristic fallback instead.
+    and state can be matched to the training data's vocabulary.
+    Returns a dict with the prediction and how inputs were resolved, or None
+    to signal the caller should use the heuristic fallback instead.
     """
     if yield_model is None or yield_meta is None:
         return None
@@ -369,177 +441,286 @@ def get_ml_yield_estimate(crop: str, state: str, season: str, area: float) -> Op
     resolved_crop = _resolve_category(crop, yield_meta["valid_crops"], CROP_NAME_TO_DATASET)
     if resolved_crop is None:
         return None  # crop isn't in the training vocabulary (e.g. aggregate categories, Coconut)
+    resolved_state = _resolve_category(state, yield_meta["valid_states"])
+    if resolved_state is None:
+        return None  # don't guess some other state's yields
 
-    resolved_state = _resolve_category(state, yield_meta["valid_states"]) or yield_meta["valid_states"][0]
-    resolved_season = _resolve_category(season, yield_meta["valid_seasons"]) or "Kharif"
-    crop_type = yield_meta["crop_to_type"].get(resolved_crop, "Cereals")
+    resolved_season, season_note = _resolve_season(resolved_crop, resolved_state, season)
+    resolved_district = _resolve_district(district, resolved_state)
 
-    encoders = yield_meta["encoders"]
+    categories = yield_meta["categories"]
     row = {
-        "State Name": _encode_or_unseen(encoders["State Name"], resolved_state),
-        "District Name": _encode_or_unseen(encoders["District Name"], "__unseen__"),
-        "Crop Name": _encode_or_unseen(encoders["Crop Name"], resolved_crop),
-        "Crop Type": _encode_or_unseen(encoders["Crop Type"], crop_type),
-        "Season": _encode_or_unseen(encoders["Season"], resolved_season),
-        "Area": float(area) if area else float(yield_meta["state_avg_area"].get(resolved_state, 10.0)),
-        "YearStart": datetime.now().year,
+        "State Name": resolved_state,
+        "District Name": resolved_district,  # None -> model's learned "unknown district" branch
+        "Crop Name": resolved_crop,
+        "Season": resolved_season,
     }
-    X = pd.DataFrame([row])[yield_meta["features"]]
-    log_pred = yield_model.predict(X)[0]
-    yield_per_hectare = float(np.expm1(log_pred))
-    return max(yield_per_hectare, 0.05), resolved_crop
+    X = pd.DataFrame([row])
+    for col in yield_meta["features"]:
+        X[col] = pd.Categorical(X[col], categories=categories[col])
+    yield_per_hectare = max(float(np.expm1(yield_model.predict(X[yield_meta["features"]])[0])), 0.05)
+
+    range_key = "known_district" if resolved_district else "unknown_district"
+    return {
+        "yield": yield_per_hectare,
+        "range_multipliers": yield_meta["range_multipliers"][range_key],
+        "crop": resolved_crop,
+        "state": resolved_state,
+        "season": resolved_season,
+        "district": resolved_district,
+        "season_note": season_note,
+        "district_median": yield_meta["district_median"].get(
+            (resolved_crop, resolved_state, resolved_district, resolved_season)) if resolved_district else None,
+        "state_median": yield_meta["state_median"].get((resolved_crop, resolved_state, resolved_season)),
+    }
+
+
+def _rainfall_effect(crop: str, rainfall_mm: float) -> float:
+    """1.0 inside the crop's comfortable rainfall range, easing down to 0.8
+    as rainfall moves well outside it."""
+    low, high = CROP_RAINFALL_RANGE_MM.get(crop, DEFAULT_RAINFALL_RANGE_MM)
+    if rainfall_mm <= 0:
+        return 1.0  # unknown - don't penalise
+    if rainfall_mm < low:
+        shortfall = (low - rainfall_mm) / low          # 0..1
+        return max(0.8, 1.0 - 0.4 * shortfall)
+    if rainfall_mm > high:
+        excess = (rainfall_mm - high) / high
+        return max(0.8, 1.0 - 0.2 * excess)
+    return 1.0
+
+
+# Inputs of an ordinary Indian farm; the ML estimate is anchored to these.
+# Crop-specific (fertilizer is ~80% of that crop's recommended dose) - use
+# agronomy.typical_inputs(crop). This generic copy is kept for callers that
+# have no crop.
+TYPICAL_FARM_INPUTS = agronomy.typical_inputs("")
+
+# Display labels for the "why this number" breakdown, in display order.
+FACTOR_LABELS = {
+    "season": "Season",
+    "state": "State",
+    "ph": "Soil pH",
+    "nutrients": "Soil N-P-K",
+    "organic_carbon": "Soil organic carbon",
+    "fertilizer": "Fertilizer use",
+    "pesticide": "Crop protection",
+    "rainfall": "Rainfall vs normal",
+    "irrigation": "Irrigation",
+    "weather": "Current weather",
+}
+
+
+def _agronomic_components(crop: str, ph: float, n: float, p: float, k: float, organic_carbon: float,
+                          fertilizer: float, pesticide: float, rainfall_mm: float,
+                          state: Optional[str] = None, irrigation: Optional[float] = None) -> Dict[str, float]:
+    """Individual multipliers from soil health, inputs, rainfall and irrigation.
+    Soil/input rules are in agronomy.py (ICAR ratings, crop-specific doses);
+    for crops covered by ICRISAT district data, fertilizer, rainfall and
+    irrigation effects are the measured ones instead."""
+    components = {
+        **agronomy.soil_and_input_components(crop, ph, n, p, k, organic_carbon, fertilizer, pesticide),
+        "rainfall": _rainfall_effect(crop, rainfall_mm),
+    }
+    components.update(agronomy.learned_components(crop, state, fertilizer, rainfall_mm, irrigation))
+    return components
+
+
+_FETCH_WEATHER = object()
+
+
+def build_prediction_context(input_data: YieldInput, weather_data=_FETCH_WEATHER) -> Dict:
+    """
+    The slow part of a prediction: weather lookup and the ML model. Everything
+    that depends only on location/crop/season, not on the farmer's soil and
+    input numbers. The returned context (minus weather_data/ml) is all
+    apply_farm_inputs needs, which is what lets the what-if sliders
+    recalculate instantly without repeating these calls.
+
+    Pass weather_data (possibly None) to reuse an existing lookup, e.g. when
+    comparing many crops for the same field.
+    """
+    crop = input_data.crop
+    if not crop and input_data.crop_type:
+        crop = input_data.crop_type
+
+    area_ha = input_data.area
+    if (input_data.area_unit or "").lower().startswith("acre"):
+        area_ha = input_data.area * ACRES_TO_HECTARES
+
+    # Location for weather: the farmer's own coordinates if given, else a
+    # geocoded region, else the state's centre.
+    if input_data.latitude and input_data.longitude:
+        location_coords = {"lat": input_data.latitude, "lon": input_data.longitude}
+    else:
+        location_coords = STATE_COORDINATES.get(input_data.state, {"lat": 19.7515, "lon": 75.7139})
+        if input_data.region:
+            geocode_data = get_geocode_data(f"{input_data.region}, {input_data.state}, India")
+            if geocode_data:
+                location_coords = geocode_data
+
+    if weather_data is _FETCH_WEATHER:
+        weather_data = get_weather_data(location_coords['lat'], location_coords['lon'])
+
+    # Base yield: trained ML model first, coefficient heuristic as fallback
+    # when the crop/state can't be matched to the training vocabulary.
+    ml = get_ml_yield_estimate(crop, input_data.state, input_data.season, input_data.district)
+    if ml is not None:
+        base_yield = ml["yield"]
+        model_source = "ml"
+    else:
+        base_yield = CROP_COEFFICIENTS.get(crop, 3.0)  # Default to 3.0 if crop not found
+        model_source = "heuristic"
+
+    # The farmer's annual rainfall (the form auto-fills the last 12 months
+    # for their location) is judged against their state's normal - see
+    # agronomy.learned_components. Short-range forecasts and today's
+    # temperature are deliberately NOT turned into yield multipliers: a few
+    # days of weather says little about a whole season's harvest, and those
+    # rules were hand-made rather than measured. Live weather still drives
+    # the weather-based recommendations.
+    rainfall = input_data.annual_rainfall
+    weather_effect = 1.0
+
+    return {
+        "crop": crop,
+        "state": input_data.state,
+        "area_ha": area_ha,
+        "base_yield": base_yield,
+        "model_source": model_source,
+        "range_multipliers": ml["range_multipliers"] if ml else None,
+        "season_multiplier": SEASON_COEFFICIENTS.get(input_data.season, 1.0),
+        "state_multiplier": STATE_COEFFICIENTS.get(input_data.state, 1.0),
+        "rainfall_mm": rainfall,
+        "weather_effect": weather_effect,
+        # Not needed by apply_farm_inputs; stripped before sending to the client
+        "weather_data": weather_data,
+        "ml": ml,
+    }
+
+
+def apply_farm_inputs(context: Dict, ph: float, n: float, p: float, k: float, organic_carbon: float,
+                      fertilizer: float, pesticide: float, irrigation: Optional[float] = None) -> Dict:
+    """
+    The fast, pure part of a prediction: adjust the base yield for the
+    farmer's soil and inputs. No network or model calls.
+    Returns yield, production, likely range and a per-factor breakdown
+    (percent change each factor contributed).
+    """
+    crop = context["crop"]
+    state = context.get("state")
+    components = _agronomic_components(crop, ph, n, p, k, organic_carbon, fertilizer, pesticide,
+                                       context["rainfall_mm"], state=state, irrigation=irrigation)
+    components["weather"] = context["weather_effect"]
+
+    # Both base yields (ML model and crop coefficients) describe a typical
+    # farm, so the farmer's soil and inputs are compared against a typical
+    # farm (not an ideal one): average inputs leave the estimate unchanged.
+    typical = _agronomic_components(crop, rainfall_mm=0, state=state, **agronomy.typical_inputs(crop))
+    typical["weather"] = 1.0
+    ratios = {f: components[f] / typical[f] for f in components}
+
+    # Bound the farm-input adjustment so a handful of self-reported fields
+    # can't swamp the base estimate: -25%/+30% around the ML model's learned
+    # number (wide enough for measured irrigation/drought effects), a little
+    # wider around the much cruder heuristic.
+    lo, hi = (0.75, 1.3) if context["model_source"] == "ml" else (0.65, 1.35)
+    raw = float(np.prod(list(ratios.values())))
+    adjusted = max(lo, min(hi, raw))
+    # If the cap kicked in, shrink every factor proportionally (in log
+    # space) so the breakdown still multiplies out to the real result.
+    if raw != adjusted and raw > 0:
+        scale = np.log(adjusted) / np.log(raw)
+        ratios = {f: float(np.exp(np.log(r) * scale)) for f, r in ratios.items()}
+    combined = adjusted
+
+    if context["model_source"] != "ml":
+        # Heuristic path: state/season are not otherwise accounted for.
+        ratios = {"season": context["season_multiplier"], "state": context["state_multiplier"], **ratios}
+        combined *= context["season_multiplier"] * context["state_multiplier"]
+
+    yield_per_hectare = context["base_yield"] * combined
+    total_production = yield_per_hectare * context["area_ha"]
+
+    yield_low = yield_high = None
+    if context.get("range_multipliers"):
+        lo_mult, hi_mult = context["range_multipliers"]
+        yield_low, yield_high = yield_per_hectare * lo_mult, yield_per_hectare * hi_mult
+
+    breakdown = [
+        {"factor": f, "label": FACTOR_LABELS[f], "pct": (ratios[f] - 1.0) * 100}
+        for f in FACTOR_LABELS if f in ratios
+    ]
+
+    return {
+        "yield": yield_per_hectare,
+        "estimated_production": total_production,
+        "yield_low": yield_low,
+        "yield_high": yield_high,
+        "area_hectares": context["area_ha"],
+        "base_yield": context["base_yield"],
+        "breakdown": breakdown,
+        "agronomy_basis": agronomy.basis_note(crop),
+    }
+
+
+def predict_yield_detailed(input_data: YieldInput) -> Dict:
+    """
+    Predict crop yield based on input parameters.
+    Returns a dict with yield, production, likely range, factor breakdown,
+    recommendations, model provenance, historical context, the weather data
+    used, and a scenario_context for fast what-if recalculation.
+    """
+    context = build_prediction_context(input_data)
+    ml, weather_data, crop = context["ml"], context["weather_data"], context["crop"]
+
+    result = apply_farm_inputs(
+        context, input_data.ph, input_data.n, input_data.p, input_data.k,
+        input_data.organic_carbon, input_data.fertilizer, input_data.pesticide,
+        irrigation=input_data.irrigation,
+    )
+
+    # Recommendations: time-sensitive weather advice first, then crop advice.
+    recommendations = get_weather_based_recommendations(weather_data) if weather_data else []
+    recommendations += [r for r in CROP_RECOMMENDATIONS.get(crop, DEFAULT_RECOMMENDATIONS)
+                        if r not in recommendations]
+    recommendations = recommendations[:4]
+
+    # Notes about how the estimate was produced are always kept.
+    if ml is not None and ml["season_note"]:
+        recommendations.append(f"Note: {ml['season_note']}")
+    if ml is None:
+        recommendations.append(
+            f"Note: '{crop}' in {input_data.state} isn't in our historical training data, so this "
+            "estimate uses a simplified agronomic model rather than the trained yield model."
+        )
+
+    scenario_context = {k: v for k, v in context.items() if k not in ("weather_data", "ml")}
+
+    return {
+        **result,
+        "recommendations": recommendations,
+        "model_source": context["model_source"],
+        "model_r2": yield_meta["metrics"]["r2"] if ml else None,
+        "model_median_error_pct": (yield_meta["metrics"]["next_year"]["median_ape"] * 100) if ml else None,
+        "resolved_crop": ml["crop"] if ml else crop,
+        "resolved_season": ml["season"] if ml else input_data.season,
+        "resolved_district": ml["district"] if ml else None,
+        "district_median_yield": ml["district_median"] if ml else None,
+        "state_median_yield": ml["state_median"] if ml else None,
+        "weather_data": weather_data,
+        "scenario_context": scenario_context,
+        # Typical irrigated share in this state, for crops with measured
+        # irrigation effects (None otherwise) - the UI's starting point
+        "irrigation_baseline": agronomy.state_irrigated_share(context["state"])
+        if agronomy.uses_measured(crop, "irrigation") else None,
+    }
 
 
 def predict_yield(input_data: YieldInput) -> Tuple[float, float, List[str], str, Optional[float]]:
     """
-    Predict crop yield based on input parameters.
+    Backwards-compatible wrapper around predict_yield_detailed.
     Returns: (yield_per_hectare, total_production, recommendations, model_source, model_r2)
     """
-    # Get location data - try to get coordinates from state if not provided
-    location_coords = STATE_COORDINATES.get(input_data.state, {"lat": 19.7515, "lon": 75.7139})  # Default to Maharashtra
-    
-    # Try to get more precise location if region is provided
-    if hasattr(input_data, 'region') and input_data.region:
-        location_string = f"{input_data.region}, {input_data.state}, India"
-        geocode_data = get_geocode_data(location_string)
-        if geocode_data:
-            location_coords = geocode_data
-    
-    # Get weather data if possible
-    weather_data = get_weather_data(location_coords['lat'], location_coords['lon'])
-    
-    # Get base yield for the crop - try the trained ML model first, and fall
-    # back to the coefficient-based heuristic when the crop/state can't be
-    # matched to the training data's vocabulary (see get_ml_yield_estimate).
-    crop = input_data.crop
-    if not crop and hasattr(input_data, 'crop_type') and input_data.crop_type:
-        crop = input_data.crop_type
-
-    ml_result = get_ml_yield_estimate(crop, input_data.state, input_data.season, input_data.area)
-    if ml_result is not None:
-        base_yield, resolved_crop_name = ml_result
-        model_source = "ml"
-        model_r2 = yield_meta["metrics"]["r2"]
-    else:
-        base_yield = CROP_COEFFICIENTS.get(crop, 3.0)  # Default to 3.0 if crop not found
-        model_source = "heuristic"
-        model_r2 = None
-    
-    # Apply season effect
-    season_multiplier = SEASON_COEFFICIENTS.get(input_data.season, 1.0)
-    
-    # Apply state/region effect
-    state_multiplier = STATE_COEFFICIENTS.get(input_data.state, 1.0)
-    
-    # Calculate soil health effect (pH, NPK, organic carbon)
-    # Optimal pH is around 6.5-7.0 for most crops
-    ph_effect = 1.0 - abs(input_data.ph - 6.7) * 0.1  # Penalize deviation from optimal pH
-    ph_effect = max(0.7, min(1.1, ph_effect))  # Limit effect between 0.7 and 1.1
-    
-    # NPK effect - higher values generally better up to a point
-    n_effect = min(1.2, input_data.n / 150)  # Normalize to 1.0 at 150 kg/ha
-    p_effect = min(1.15, input_data.p / 60)  # Normalize to 1.0 at 60 kg/ha
-    k_effect = min(1.15, input_data.k / 120)  # Normalize to 1.0 at 120 kg/ha
-    
-    # Organic carbon effect - higher is better up to about 1%
-    oc_effect = min(1.2, input_data.organic_carbon / 0.8)
-    
-    # Rainfall effect - depends on crop but generally follows a bell curve
-    rainfall = input_data.annual_rainfall
-    
-    # If we have weather data with rainfall estimate, use it to refine our prediction
-    if weather_data and weather_data['monthly_rainfall_estimate'] > 0:
-        # Adjust annual rainfall estimate based on current forecast
-        current_month = datetime.now().month
-        # Weight the real-time data more heavily during growing season
-        if (input_data.season == "Kharif" and 6 <= current_month <= 10) or \
-           (input_data.season == "Rabi" and (current_month >= 11 or current_month <= 3)) or \
-           (input_data.season == "Summer" and 3 <= current_month <= 6):
-            # During growing season, give more weight to current rainfall
-            rainfall = (rainfall * 0.7) + (weather_data['monthly_rainfall_estimate'] * 30 * 0.3)
-    
-    # Calculate rainfall effect
-    rainfall_effect = 1.0 - abs(rainfall - 900) / 1500
-    rainfall_effect = max(0.7, min(1.2, rainfall_effect))
-    
-    # Fertilizer and pesticide effects - diminishing returns
-    fertilizer_effect = min(1.25, 0.8 + input_data.fertilizer / 200)
-    pesticide_effect = min(1.15, 0.9 + input_data.pesticide / 10)
-    
-    # Weather effect from real-time data
-    weather_effect = 1.0
-    if weather_data:
-        # Temperature effect varies by crop
-        temp = weather_data['current_temp']
-        if crop in ["Rice", "Maize", "Cotton", "Sugarcane"]:
-            # Warm-weather crops
-            if temp < 15:
-                weather_effect *= 0.8  # Too cold
-            elif 25 <= temp <= 35:
-                weather_effect *= 1.1  # Ideal
-            elif temp > 40:
-                weather_effect *= 0.9  # Too hot
-        elif crop in ["Wheat", "Potato"]:
-            # Cool-weather crops
-            if temp < 5:
-                weather_effect *= 0.85  # Too cold
-            elif 15 <= temp <= 25:
-                weather_effect *= 1.1  # Ideal
-            elif temp > 30:
-                weather_effect *= 0.8  # Too hot
-    
-    # Combine soil/nutrient/rainfall/weather effects into a single adjustment
-    # multiplier on top of the base yield (state and season are already
-    # baked into the ML prediction when model_source == "ml", so they're
-    # excluded from the multiplier in that case to avoid double-counting).
-    agronomic_effect = (
-        ph_effect *
-        ((n_effect + p_effect + k_effect) / 3) *
-        oc_effect *
-        rainfall_effect *
-        fertilizer_effect *
-        pesticide_effect *
-        weather_effect
-    )
-
-    if model_source == "ml":
-        # The ML model already encodes state/season/crop-driven yield
-        # differences learned from real data. Let the farmer's specific soil
-        # and input choices nudge that number, but keep the nudge bounded
-        # (+/-20%) so a handful of self-reported fields can't swamp a
-        # prediction backed by ~30k historical records.
-        combined_effect = max(0.8, min(1.2, agronomic_effect))
-    else:
-        # Heuristic path (unchanged): state/season are not otherwise
-        # accounted for, so fold them into the multiplier here.
-        combined_effect = season_multiplier * state_multiplier * agronomic_effect
-
-    # Add a small random variation (±5%)
-    random_factor = 0.95 + random.random() * 0.1
-    
-    # Calculate final yield per hectare
-    yield_per_hectare = base_yield * combined_effect * random_factor
-    
-    # Calculate total production based on area
-    total_production = yield_per_hectare * input_data.area
-    
-    # Get recommendations for the crop
-    recommendations = CROP_RECOMMENDATIONS.get(crop, DEFAULT_RECOMMENDATIONS).copy()
-
-    # Add weather-based recommendations if available
-    if weather_data:
-        weather_recs = get_weather_based_recommendations(weather_data)
-        if weather_recs:
-            recommendations.extend(weather_recs)
-
-    if model_source == "heuristic":
-        recommendations.append(
-            f"Note: '{crop}' isn't in our historical training data, so this estimate "
-            "uses a simplified agronomic model rather than the trained yield model."
-        )
-
-    # Ensure we don't return more than 4 recommendations
-    if len(recommendations) > 4:
-        recommendations = recommendations[:4]
-
-    return yield_per_hectare, total_production, recommendations, model_source, model_r2
+    r = predict_yield_detailed(input_data)
+    return r["yield"], r["estimated_production"], r["recommendations"], r["model_source"], r["model_r2"]

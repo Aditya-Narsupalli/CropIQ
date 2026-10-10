@@ -61,6 +61,12 @@ function DiseaseDetector() {
   const [file, setFile] = useState(null);
   const [previewUrl, setPreviewUrl] = useState("");
   const [analysisResult, setAnalysisResult] = useState("");
+  // Trained classifier's result ({crop, disease, confidence, top_predictions, ...})
+  // and which engine produced the analysis ("model+gemini" | "model" | "gemini")
+  const [modelFinding, setModelFinding] = useState(null);
+  const [analysisSource, setAnalysisSource] = useState("gemini");
+  // Past Kisan Call Centre expert answers about the identified disease
+  const [kccReferences, setKccReferences] = useState([]);
   const [error, setError] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
@@ -258,6 +264,8 @@ function DiseaseDetector() {
 
     setIsLoading(true);
     setAnalysisResult("");
+    setModelFinding(null);
+    setKccReferences([]);
     setError("");
     setAnalysisStage(1);
 
@@ -268,6 +276,9 @@ function DiseaseDetector() {
       setTimeout(() => {
         setProgressPercent(100);
         setAnalysisResult(result.analysis.replaceAll("*", ""));
+        setModelFinding(result.model_finding || null);
+        setAnalysisSource(result.source || "gemini");
+        setKccReferences(result.kcc_references || []);
         setAnalysisStage(3);
         setIsLoading(false);
       }, 1500);
@@ -629,11 +640,82 @@ function DiseaseDetector() {
                       <MdOutlineHealthAndSafety className="mr-2 text-sky-600" />
                       {t("analysisResults")}
                     </h3>
+                    {modelFinding ? (
+                      <div
+                        className={`mb-4 p-4 rounded-lg border ${
+                          modelFinding.confident ? "bg-emerald-50 border-emerald-200" : "bg-amber-50 border-amber-200"
+                        }`}
+                      >
+                        <p className="text-xs uppercase tracking-wider text-gray-500 mb-1">
+                          CropIQ trained model · {modelFinding.crop}
+                        </p>
+                        <p className="text-lg font-semibold text-gray-900">
+                          {modelFinding.disease}{" "}
+                          <span className="text-sm font-normal text-gray-600">
+                            ({Math.round(modelFinding.confidence * 100)}% probability)
+                          </span>
+                        </p>
+                        {!modelFinding.confident && (
+                          <p className="text-xs text-amber-800 mt-1">
+                            Not confident - try a clear, close-up daylight photo of one affected leaf.
+                          </p>
+                        )}
+                        <div className="mt-3 space-y-1.5">
+                          {modelFinding.top_predictions.map((p) => (
+                            <div key={p.disease} className="flex items-center gap-2 text-xs">
+                              <span className="w-40 shrink-0 text-gray-700 truncate">{p.disease}</span>
+                              <div className="flex-1 h-2 bg-white rounded">
+                                <div
+                                  className="h-2 rounded bg-emerald-500"
+                                  style={{ width: `${Math.round(p.probability * 100)}%` }}
+                                />
+                              </div>
+                              <span className="w-10 text-right text-gray-600">{Math.round(p.probability * 100)}%</span>
+                            </div>
+                          ))}
+                        </div>
+                        <p className="text-[11px] text-gray-500 mt-2">
+                          Trained on real field photos
+                          {modelFinding.model_accuracy
+                            ? `; about ${Math.round(modelFinding.model_accuracy * 100)}% accurate for ${modelFinding.crop} on photos it hadn't seen`
+                            : ""}
+                          . Recognises: {modelFinding.possible_diseases.join(", ")}.
+                        </p>
+                      </div>
+                    ) : (
+                      <p className="mb-3 text-xs text-gray-500">
+                        The trained model doesn't cover this crop yet, so this analysis is from Gemini AI.
+                      </p>
+                    )}
+                    {analysisSource === "model" && (
+                      <p className="mb-3 text-xs text-gray-500">
+                        Detailed AI advice is temporarily unavailable; showing the trained model's result.
+                      </p>
+                    )}
                     <div className="bg-sky-50 p-4 rounded-lg border border-sky-100">
                       <pre className="whitespace-pre-wrap text-gray-700">
                         {analysisResult}
                       </pre>
                     </div>
+                    {kccReferences.length > 0 && (
+                      <div className="mt-4 p-4 rounded-lg border border-amber-200 bg-amber-50">
+                        <h4 className="text-sm font-semibold text-amber-900">
+                          What Kisan Call Centre experts advised for this
+                        </h4>
+                        <p className="text-[11px] text-amber-800 mb-3">
+                          Real answers from India's farmer helpline archive (past years, logged from specific
+                          places). Confirm products and doses with your local Krishi Vigyan Kendra before spraying.
+                        </p>
+                        <div className="space-y-2">
+                          {kccReferences.map((ref, i) => (
+                            <details key={i} className="bg-white rounded border border-amber-100 p-2 text-sm">
+                              <summary className="cursor-pointer text-gray-800">{ref.question}</summary>
+                              <p className="mt-2 text-gray-700 whitespace-pre-wrap">{ref.answer}</p>
+                            </details>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>

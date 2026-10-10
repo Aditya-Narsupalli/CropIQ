@@ -1,0 +1,521 @@
+{
+  "source": "ICRISAT District Level Database via Mendeley Data doi:10.17632/ywp3y5j9vv.1 (CC BY 4.0)",
+  "method": "Two-way fixed effects (district, year) per crop; 90% CIs from district bootstrap",
+  "crops": {
+    "Rice": {
+      "fertilizer_elasticity": 0.0738,
+      "fertilizer_elasticity_90ci": [
+        0.0509,
+        0.0981
+      ],
+      "rain_linear": 0.3758,
+      "rain_quadratic": -0.05,
+      "rain_range_mm": [
+        510,
+        2707
+      ],
+      "irrigation_coef": 0.2786,
+      "irrigation_coef_90ci": [
+        0.1684,
+        0.3623
+      ],
+      "rain_dry_vs_wet_log_effect_90ci": [
+        0.2912,
+        0.3673
+      ],
+      "use": {
+        "fertilizer": true,
+        "irrigation": true,
+        "rainfall": true
+      },
+      "not_used_because": {},
+      "n_observations": 9749,
+      "n_districts": 468,
+      "years": [
+        1990,
+        2015
+      ]
+    },
+    "Bajra": {
+      "fertilizer_elasticity": 0.0148,
+      "fertilizer_elasticity_90ci": [
+        -0.0391,
+        0.0623
+      ],
+      "rain_linear": 1.7268,
+      "rain_quadratic": -0.8391,
+      "rain_range_mm": [
+        298,
+        1235
+      ],
+      "irrigation_coef": 0.1197,
+      "irrigation_coef_90ci": [
+        -0.0402,
+        0.3186
+      ],
+      "rain_dry_vs_wet_log_effect_90ci": [
+        0.2433,
+        0.4309
+      ],
+      "use": {
+        "fertilizer": false,
+        "irrigation": false,
+        "rainfall": true
+      },
+      "not_used_because": {
+        "fertilizer": "effect not clearly measurable in this data",
+        "irrigation": "effect not clearly measurable in this data"
+      },
+      "n_observations": 3591,
+      "n_districts": 176,
+      "years": [
+        1990,
+        2015
+      ]
+    },
+    "Gram": {
+      "fertilizer_elasticity": 0.0954,
+      "fertilizer_elasticity_90ci": [
+        0.0527,
+        0.1427
+      ],
+      "rain_linear": 0.5824,
+      "rain_quadratic": -0.1246,
+      "rain_range_mm": [
+        375,
+        1557
+      ],
+      "irrigation_coef": 0.1136,
+      "irrigation_coef_90ci": [
+        -0.0222,
+        0.2553
+      ],
+      "rain_dry_vs_wet_log_effect_90ci": [
+        0.2634,
+        0.3669
+      ],
+      "use": {
+        "fertilizer": true,
+        "irrigation": false,
+        "rainfall": true
+      },
+      "not_used_because": {
+        "irrigation": "effect not clearly measurable in this data"
+      },
+      "n_observations": 5209,
+      "n_districts": 262,
+      "years": [
+        1990,
+        2015
+      ]
+    },
+    "Groundnut": {
+      "fertilizer_elasticity": 0.0414,
+      "fertilizer_elasticity_90ci": [
+        -0.0422,
+        0.135
+      ],
+      "rain_linear": 0.4488,
+      "rain_quadratic": -0.0612,
+      "rain_range_mm": [
+        408,
+        1834
+      ],
+      "irrigation_coef": 0.3589,
+      "irrigation_coef_90ci": [
+        0.1232,
+        0.6222
+      ],
+      "rain_dry_vs_wet_log_effect_90ci": [
+        0.271,
+        0.4282
+      ],
+      "use": {
+        "fertilizer": false,
+        "irrigation": true,
+        "rainfall": true
+      },
+      "not_used_because": {
+        "fertilizer": "effect not clearly measurable in this data"
+      },
+      "n_observations": 4633,
+      "n_districts": 232,
+      "years": [
+        1990,
+        2015
+      ]
+    },
+    "Sugarcane": {
+      "fertilizer_elasticity": 0.0551,
+      "fertilizer_elasticity_90ci": [
+        0.0341,
+        0.0806
+      ],
+      "rain_linear": -0.0245,
+      "rain_quadratic": -0.0033,
+      "rain_range_mm": [
+        496,
+        1815
+      ],
+      "irrigation_coef": -0.0561,
+      "irrigation_coef_90ci": [
+        -0.1339,
+        0.0582
+      ],
+      "rain_dry_vs_wet_log_effect_90ci": [
+        -0.0544,
+        -0.0077
+      ],
+      "use": {
+        "fertilizer": true,
+        "irrigation": false,
+        "rainfall": true
+      },
+      "not_used_because": {
+        "irrigation": "effect not clearly measurable in this data"
+      },
+      "n_observations": 4685,
+      "n_districts": 237,
+      "years": [
+        1990,
+        2015
+      ]
+    },
+    "Wheat": {
+      "fertilizer_elasticity": 0.0727,
+      "fertilizer_elasticity_90ci": [
+        0.037,
+        0.1157
+      ],
+      "rain_linear": 0.2686,
+      "rain_quadratic": -0.0498,
+      "rain_range_mm": [
+        372,
+        1785
+      ],
+      "irrigation_coef": 0.2687,
+      "irrigation_coef_90ci": [
+        0.1879,
+        0.3589
+      ],
+      "rain_dry_vs_wet_log_effect_90ci": [
+        0.135,
+        0.2152
+      ],
+      "use": {
+        "fertilizer": true,
+        "irrigation": true,
+        "rainfall": true
+      },
+      "not_used_because": {},
+      "n_observations": 5158,
+      "n_districts": 226,
+      "years": [
+        1990,
+        2015
+      ]
+    },
+    "Maize": {
+      "fertilizer_elasticity": 0.0713,
+      "fertilizer_elasticity_90ci": [
+        0.0045,
+        0.1143
+      ],
+      "rain_linear": 0.1143,
+      "rain_quadratic": -0.0449,
+      "rain_range_mm": [
+        527,
+        1879
+      ],
+      "irrigation_coef": -0.1515,
+      "irrigation_coef_90ci": [
+        -0.3427,
+        0.0616
+      ],
+      "rain_dry_vs_wet_log_effect_90ci": [
+        -0.0315,
+        0.0538
+      ],
+      "use": {
+        "fertilizer": true,
+        "irrigation": false,
+        "rainfall": false
+      },
+      "not_used_because": {
+        "irrigation": "effect not clearly measurable in this data",
+        "rainfall": "effect not clearly measurable in this data"
+      },
+      "n_observations": 4659,
+      "n_districts": 210,
+      "years": [
+        1990,
+        2015
+      ]
+    },
+    "Jowar": {
+      "fertilizer_elasticity": 0.0624,
+      "fertilizer_elasticity_90ci": [
+        -0.0049,
+        0.1691
+      ],
+      "rain_linear": 0.6573,
+      "rain_quadratic": -0.1777,
+      "rain_range_mm": [
+        395,
+        1585
+      ],
+      "irrigation_coef": 0.1706,
+      "irrigation_coef_90ci": [
+        -0.1199,
+        0.5766
+      ],
+      "rain_dry_vs_wet_log_effect_90ci": [
+        0.1991,
+        0.3649
+      ],
+      "use": {
+        "fertilizer": false,
+        "irrigation": false,
+        "rainfall": true
+      },
+      "not_used_because": {
+        "fertilizer": "effect not clearly measurable in this data",
+        "irrigation": "effect not clearly measurable in this data"
+      },
+      "n_observations": 3485,
+      "n_districts": 163,
+      "years": [
+        1990,
+        2015
+      ]
+    },
+    "Ragi": {
+      "fertilizer_elasticity": -0.0714,
+      "fertilizer_elasticity_90ci": [
+        -0.129,
+        -0.0103
+      ],
+      "rain_linear": 0.2589,
+      "rain_quadratic": -0.0427,
+      "rain_range_mm": [
+        554,
+        2801
+      ],
+      "irrigation_coef": -0.1657,
+      "irrigation_coef_90ci": [
+        -0.4909,
+        0.0313
+      ],
+      "rain_dry_vs_wet_log_effect_90ci": [
+        0.1086,
+        0.3456
+      ],
+      "use": {
+        "fertilizer": false,
+        "irrigation": false,
+        "rainfall": true
+      },
+      "not_used_because": {
+        "fertilizer": "effect not clearly measurable in this data",
+        "irrigation": "effect not clearly measurable in this data"
+      },
+      "n_observations": 1176,
+      "n_districts": 62,
+      "years": [
+        1990,
+        2015
+      ]
+    },
+    "Tur": {
+      "fertilizer_elasticity": -0.0144,
+      "fertilizer_elasticity_90ci": [
+        -0.1292,
+        0.113
+      ],
+      "rain_linear": 0.6841,
+      "rain_quadratic": -0.1531,
+      "rain_range_mm": [
+        525,
+        1694
+      ],
+      "irrigation_coef": -0.1428,
+      "irrigation_coef_90ci": [
+        -0.4405,
+        0.111
+      ],
+      "rain_dry_vs_wet_log_effect_90ci": [
+        0.2837,
+        0.3813
+      ],
+      "use": {
+        "fertilizer": false,
+        "irrigation": false,
+        "rainfall": true
+      },
+      "not_used_because": {
+        "fertilizer": "effect not clearly measurable in this data",
+        "irrigation": "effect not clearly measurable in this data"
+      },
+      "n_observations": 3998,
+      "n_districts": 191,
+      "years": [
+        1990,
+        2015
+      ]
+    },
+    "Cotton": {
+      "fertilizer_elasticity": 0.2587,
+      "fertilizer_elasticity_90ci": [
+        0.1222,
+        0.3573
+      ],
+      "rain_linear": 0.3963,
+      "rain_quadratic": -0.1136,
+      "rain_range_mm": [
+        322,
+        1674
+      ],
+      "irrigation_coef": 0.071,
+      "irrigation_coef_90ci": [
+        -0.2002,
+        0.3746
+      ],
+      "rain_dry_vs_wet_log_effect_90ci": [
+        0.1093,
+        0.2622
+      ],
+      "use": {
+        "fertilizer": false,
+        "irrigation": false,
+        "rainfall": true
+      },
+      "not_used_because": {
+        "fertilizer": "confounded with Bt cotton adoption (2002-2010)",
+        "irrigation": "effect not clearly measurable in this data"
+      },
+      "n_observations": 2301,
+      "n_districts": 109,
+      "years": [
+        1990,
+        2015
+      ]
+    },
+    "Soyabean": {
+      "fertilizer_elasticity": 0.0863,
+      "fertilizer_elasticity_90ci": [
+        0.0219,
+        0.1396
+      ],
+      "rain_linear": 0.6559,
+      "rain_quadratic": -0.3268,
+      "rain_range_mm": [
+        608,
+        1589
+      ],
+      "irrigation_coef": 0.211,
+      "irrigation_coef_90ci": [
+        -0.2479,
+        0.4988
+      ],
+      "rain_dry_vs_wet_log_effect_90ci": [
+        -0.0713,
+        0.0392
+      ],
+      "use": {
+        "fertilizer": true,
+        "irrigation": false,
+        "rainfall": false
+      },
+      "not_used_because": {
+        "irrigation": "effect not clearly measurable in this data",
+        "rainfall": "effect not clearly measurable in this data"
+      },
+      "n_observations": 1360,
+      "n_districts": 68,
+      "years": [
+        1990,
+        2015
+      ]
+    },
+    "Sunflower": {
+      "fertilizer_elasticity": 0.1166,
+      "fertilizer_elasticity_90ci": [
+        -0.0103,
+        0.2239
+      ],
+      "rain_linear": 0.4107,
+      "rain_quadratic": -0.0481,
+      "rain_range_mm": [
+        518,
+        1731
+      ],
+      "irrigation_coef": 0.6223,
+      "irrigation_coef_90ci": [
+        0.1353,
+        1.1325
+      ],
+      "rain_dry_vs_wet_log_effect_90ci": [
+        0.1599,
+        0.3668
+      ],
+      "use": {
+        "fertilizer": false,
+        "irrigation": true,
+        "rainfall": true
+      },
+      "not_used_because": {
+        "fertilizer": "effect not clearly measurable in this data"
+      },
+      "n_observations": 1177,
+      "n_districts": 69,
+      "years": [
+        1990,
+        2015
+      ]
+    }
+  },
+  "state_irrigated_share": {
+    "Andhra Pradesh": 0.472,
+    "Assam": 0.064,
+    "Bihar": 0.658,
+    "Chhattisgarh": 0.2,
+    "Gujarat": 0.471,
+    "Haryana": 0.938,
+    "Himachal Pradesh": 0.194,
+    "Jharkhand": 0.114,
+    "Karnataka": 0.283,
+    "Kerala": 0.11,
+    "Madhya Pradesh": 0.377,
+    "Odisha": 0.325,
+    "Punjab": 0.999,
+    "Rajasthan": 0.387,
+    "Tamil Nadu": 0.583,
+    "Telangana": 0.45,
+    "Uttar Pradesh": 0.828,
+    "Uttarakhand": 0.169
+  },
+  "national_irrigated_share": 0.461,
+  "state_normal_rainfall_mm": {
+    "Andhra Pradesh": 921,
+    "Assam": 2315,
+    "Bihar": 1046,
+    "Chhattisgarh": 1348,
+    "Gujarat": 816,
+    "Haryana": 555,
+    "Himachal Pradesh": 1143,
+    "Jharkhand": 1213,
+    "Karnataka": 857,
+    "Kerala": 2821,
+    "Madhya Pradesh": 1000,
+    "Maharashtra": 997,
+    "Odisha": 1509,
+    "Punjab": 640,
+    "Rajasthan": 572,
+    "Tamil Nadu": 993,
+    "Telangana": 932,
+    "Uttar Pradesh": 890,
+    "Uttarakhand": 1325,
+    "West Bengal": 1478
+  },
+  "national_normal_rainfall_mm": 1031
+}

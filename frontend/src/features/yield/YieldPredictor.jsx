@@ -26,13 +26,23 @@ import { GiFarmTractor, GiWheat } from "react-icons/gi";
 import { WiHumidity } from "react-icons/wi";
 import { MdOutlineScience, MdOutlineWaterDrop } from "react-icons/md";
 import LocationMapPicker from "../../components/LocationMapPicker";
+import YieldInsights from "./YieldInsights";
 
-// States supported by the backend's yield model (must match STATE_COEFFICIENTS keys exactly)
+// States covered by the backend's trained yield model (spelling must match
+// the training data's state names; matching is case-insensitive)
 const INDIAN_STATES = [
-  "Maharashtra", "Karnataka", "Gujarat", "Madhya Pradesh", "Punjab",
-  "Haryana", "Uttar Pradesh", "Bihar", "West Bengal", "Tamil Nadu",
-  "Andhra Pradesh", "Telangana",
+  "Andhra Pradesh", "Assam", "Bihar", "Chhattisgarh", "Goa", "Gujarat",
+  "Haryana", "Himachal Pradesh", "Jammu And Kashmir", "Jharkhand",
+  "Karnataka", "Kerala", "Madhya Pradesh", "Maharashtra", "Manipur",
+  "Meghalaya", "Mizoram", "Nagaland", "Odisha", "Punjab", "Rajasthan",
+  "Sikkim", "Tamil Nadu", "Telangana", "Tripura", "Uttar Pradesh",
+  "Uttarakhand", "West Bengal",
 ];
+
+// District name from an OSM reverse-geocode address (the backend matches it
+// to its own district list, e.g. "Ludhiana District" -> "Ludhiana")
+const extractDistrict = (address) =>
+  address?.state_district || address?.county || address?.district || "";
 
 // Mirrors the backend's season-window logic in yield_service.py
 const getCurrentSeason = () => {
@@ -124,14 +134,16 @@ function YieldPredictor() {
     annual_rainfall: "",
     fertilizer: "",
     pesticide: "",
+    irrigation: "",
     ph: "6.5",
-    n: "140",
-    p: "50",
+    n: "280",
+    p: "15",
     k: "200",
     organic_carbon: "0.5",
     latitude: "",
     longitude: "",
     location_name: "",
+    district: "",
   });
 
   // UI state (remains the same)
@@ -290,37 +302,38 @@ function YieldPredictor() {
     return null;
   }, []);
 
-  const detectStateFromCoords = useCallback(async (lat, lng) => {
+  const reverseGeocode = useCallback(async (lat, lng) => {
     try {
       const response = await fetch(
         `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}`
       );
       const data = await response.json();
-      return matchStateName(data?.address?.state);
+      return data?.address || null;
     } catch (err) {
-      console.error("Failed to detect state:", err);
+      console.error("Failed to reverse geocode location:", err);
       return null;
     }
   }, []);
 
-  // Fills in state, season, and annual_rainfall once a location is known.
+  // Fills in state, district, season, and annual_rainfall once a location is known.
   // addressData is reused if the caller already has an OSM reverse-geocode response.
   const applyLocationDerivedFields = useCallback(
     async (lat, lng, addressData) => {
-      const detectedState =
-        matchStateName(addressData?.address?.state) ||
-        (await detectStateFromCoords(lat, lng));
+      const address = addressData?.address || (await reverseGeocode(lat, lng));
+      const detectedState = matchStateName(address?.state);
+      const detectedDistrict = extractDistrict(address);
       const annualRainfall = await fetchAnnualRainfall(lat, lng);
 
       setFormData((prev) => ({
         ...prev,
         state: detectedState || prev.state,
+        district: detectedDistrict,
         season: prev.season || getCurrentSeason(),
         annual_rainfall:
           annualRainfall !== null ? annualRainfall : prev.annual_rainfall,
       }));
     },
-    [detectStateFromCoords, fetchAnnualRainfall]
+    [reverseGeocode, fetchAnnualRainfall]
   );
 
   const handleLocationSelection = useCallback(
@@ -401,17 +414,22 @@ function YieldPredictor() {
           annual_rainfall: Number.parseFloat(formData.annual_rainfall) || 0,
           fertilizer: Number.parseFloat(formData.fertilizer) || 0,
           pesticide: Number.parseFloat(formData.pesticide) || 0,
+          irrigation: formData.irrigation === "" ? null : Number.parseFloat(formData.irrigation),
           ph: Number.parseFloat(formData.ph) || 0,
           n: Number.parseFloat(formData.n) || 0,
           p: Number.parseFloat(formData.p) || 0,
           k: Number.parseFloat(formData.k) || 0,
           organic_carbon: Number.parseFloat(formData.organic_carbon) || 0,
         };
-        // Include location data if available
+        // Include location data if available. Otherwise drop the empty
+        // strings - the backend expects numbers or nothing, and rejects "".
         if (formData.latitude && formData.longitude) {
           numericData.latitude = Number.parseFloat(formData.latitude);
           numericData.longitude = Number.parseFloat(formData.longitude);
           numericData.location_name = formData.location_name; // Keep string name
+        } else {
+          delete numericData.latitude;
+          delete numericData.longitude;
         }
 
         // ---- API Call ----
@@ -424,7 +442,7 @@ function YieldPredictor() {
         await new Promise((resolve) => setTimeout(resolve, 1000));
         if (!isLoadingRef.current) return;
 
-        setPrediction(result); // Set prediction state
+        setPrediction({ ...result, _id: Date.now() }); // _id remounts YieldInsights per prediction
         setAnalysisStage(3); // Set stage to complete
         setProgressPercent(100); // Set progress to 100%
 
@@ -464,14 +482,16 @@ function YieldPredictor() {
       annual_rainfall: "",
       fertilizer: "",
       pesticide: "",
+      irrigation: "",
       ph: "6.5",
-      n: "140",
-      p: "50",
+      n: "280",
+      p: "15",
       k: "200",
       organic_carbon: "0.5",
       latitude: "",
       longitude: "",
       location_name: "",
+      district: "",
     });
     setPrediction(null);
     setError("");
@@ -825,7 +845,7 @@ function YieldPredictor() {
                           <div className="text-blue-700">🌧️ Precipitation: <span className="font-medium">{locationWeather.precipitation} mm</span></div>
                         </div>
                       )}
-                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
                         <div className="form-group">
                           <label className="block text-xs font-medium text-gray-700 mb-1">
                             State <span className="text-red-500">*</span>
@@ -833,7 +853,10 @@ function YieldPredictor() {
                           <select
                             name="state"
                             value={formData.state}
-                            onChange={handleChange}
+                            onChange={(e) =>
+                              // A district from the previous state no longer applies
+                              setFormData((prev) => ({ ...prev, state: e.target.value, district: "" }))
+                            }
                             className="w-full p-2.5 border border-gray-300 rounded-lg focus:ring-1 focus:ring-amber-500 focus:border-amber-500 bg-white text-sm"
                             required
                           >
@@ -844,6 +867,19 @@ function YieldPredictor() {
                               </option>
                             ))}
                           </select>
+                        </div>
+                        <div className="form-group">
+                          <label className="block text-xs font-medium text-gray-700 mb-1">
+                            District <span className="text-gray-400">(optional, improves accuracy)</span>
+                          </label>
+                          <input
+                            type="text"
+                            name="district"
+                            value={formData.district}
+                            onChange={handleChange}
+                            placeholder="Auto-filled from location"
+                            className="w-full p-2.5 border border-gray-300 rounded-lg focus:ring-1 focus:ring-amber-500 focus:border-amber-500 text-sm"
+                          />
                         </div>
                         <div className="form-group">
                           <label className="block text-xs font-medium text-gray-700 mb-1">
@@ -859,6 +895,7 @@ function YieldPredictor() {
                             <option value="Kharif">Kharif</option>
                             <option value="Rabi">Rabi</option>
                             <option value="Summer">Summer</option>
+                            <option value="Whole Year">Whole Year (e.g. sugarcane)</option>
                           </select>
                         </div>
                         <div className="form-group">
@@ -915,7 +952,7 @@ function YieldPredictor() {
                             name="n"
                             value={formData.n}
                             onChange={handleChange}
-                            placeholder="e.g., 140"
+                            placeholder="e.g., 280"
                             className="w-full p-2.5 border border-gray-300 rounded-lg focus:ring-1 focus:ring-amber-500 focus:border-amber-500 text-sm"
                             min="0"
                             required
@@ -931,7 +968,7 @@ function YieldPredictor() {
                             name="p"
                             value={formData.p}
                             onChange={handleChange}
-                            placeholder="e.g., 50"
+                            placeholder="e.g., 15"
                             className="w-full p-2.5 border border-gray-300 rounded-lg focus:ring-1 focus:ring-amber-500 focus:border-amber-500 text-sm"
                             min="0"
                             required
@@ -1010,6 +1047,22 @@ function YieldPredictor() {
                             step="0.01"
                             required
                           />
+                        </div>
+                        <div className="form-group">
+                          <label className="block text-sm font-medium text-gray-700 mb-1">
+                            Irrigation
+                          </label>
+                          <select
+                            name="irrigation"
+                            value={formData.irrigation}
+                            onChange={handleChange}
+                            className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-amber-500 text-sm bg-white"
+                          >
+                            <option value="">Not sure</option>
+                            <option value="0">Rain-fed (no irrigation)</option>
+                            <option value="0.5">Partly irrigated</option>
+                            <option value="1">Fully irrigated</option>
+                          </select>
                         </div>
                       </div>
                     </div>
@@ -1146,6 +1199,11 @@ function YieldPredictor() {
                               {prediction.yield.toFixed(2)}{" "}
                               <span className="text-sm font-normal">t/ha</span>
                             </p>
+                            {prediction.yield_low != null && prediction.yield_high != null && (
+                              <p className="text-xs text-sky-700 mt-1">
+                                Likely range: {prediction.yield_low.toFixed(1)}–{prediction.yield_high.toFixed(1)} t/ha
+                              </p>
+                            )}
                           </div>
                           <div className="bg-amber-50 p-4 rounded-lg border border-amber-100/50 text-center">
                             <p className="text-xs text-amber-700 font-medium mb-1 uppercase tracking-wider">
@@ -1155,8 +1213,57 @@ function YieldPredictor() {
                               {prediction.estimated_production.toFixed(2)}{" "}
                               <span className="text-sm font-normal">tons</span>
                             </p>
+                            {prediction.area_hectares != null && (
+                              <p className="text-xs text-amber-700 mt-1">
+                                over {prediction.area_hectares.toFixed(2)} ha
+                              </p>
+                            )}
                           </div>
                         </div>
+
+                        {/* Historical comparison */}
+                        {(prediction.district_median_yield != null || prediction.state_median_yield != null) && (
+                          <div className="bg-gray-50 p-3 rounded-lg border border-gray-100 text-xs text-gray-700 space-y-1">
+                            <p className="font-medium text-gray-800">
+                              Typical recorded yield ({prediction.resolved_season}, 2021–23)
+                            </p>
+                            {prediction.district_median_yield != null && (
+                              <p>
+                                {prediction.resolved_district} district:{" "}
+                                <span className="font-semibold">{prediction.district_median_yield.toFixed(2)} t/ha</span>
+                              </p>
+                            )}
+                            {prediction.state_median_yield != null && (
+                              <p>
+                                {formData.state} state:{" "}
+                                <span className="font-semibold">{prediction.state_median_yield.toFixed(2)} t/ha</span>
+                              </p>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Model provenance */}
+                        <p className="text-xs text-gray-500">
+                          {prediction.model_source === "ml" ? (
+                            <>
+                              Estimated with our model trained on government crop records
+                              {prediction.resolved_crop && prediction.resolved_crop !== formData.crop
+                                ? ` (matched to "${prediction.resolved_crop}")`
+                                : ""}
+                              {prediction.resolved_district
+                                ? `, using ${prediction.resolved_district} district data`
+                                : ", using state-level data (district not matched)"}
+                              {prediction.model_median_error_pct != null
+                                ? `. Typically within ~${Math.round(prediction.model_median_error_pct)}% of actual yields.`
+                                : "."}
+                            </>
+                          ) : (
+                            "Estimated with a simplified agronomic model (no historical records for this crop/state)."
+                          )}
+                        </p>
+
+                        {/* Income, "why this number" and what-if sliders */}
+                        <YieldInsights key={prediction._id} prediction={prediction} formData={formData} />
 
                         {/* Weather Data */}
                         {weatherData && (

@@ -16,7 +16,9 @@ import {
   FaGlobe,
   FaMicrophone, 
   FaStopCircle,
+  FaVolumeUp,
   FaSearchLocation,
+  FaPlus,
 } from "react-icons/fa";
 import { GiWheat, GiFarmTractor } from "react-icons/gi";
 import { MdOutlineScience, MdOutlineWaterDrop } from "react-icons/md";
@@ -24,6 +26,48 @@ import { WiHumidity } from "react-icons/wi";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import LocationMapPicker from "../../components/LocationMapPicker";
+
+const WELCOME_MESSAGE = {
+  role: "assistant",
+  content: "Welcome to CropIQ AI! I'm here to assist with all your agricultural needs - from crop management and weather insights to market trends and farming advice. How can I help your farm thrive today?",
+};
+
+// Tappable first questions, so farmers who aren't sure what to ask can start
+// with one tap. Languages without their own list use English - the reply
+// still comes back in the selected language.
+const STARTER_QUESTIONS = {
+  en: [
+    "What is today's wheat price?",
+    "Will it rain this week?",
+    "How much will I earn from 2 acres of rice?",
+    "My crop leaves are turning yellow. What should I do?",
+  ],
+  hi: [
+    "आज गेहूं का भाव क्या है?",
+    "क्या इस हफ्ते बारिश होगी?",
+    "2 एकड़ धान से मेरी कितनी कमाई होगी?",
+    "मेरी फसल की पत्तियाँ पीली हो रही हैं, क्या करूँ?",
+  ],
+  mr: [
+    "आज गव्हाचा भाव काय आहे?",
+    "या आठवड्यात पाऊस पडेल का?",
+    "2 एकर भातातून मला किती उत्पन्न मिळेल?",
+    "माझ्या पिकाची पाने पिवळी पडत आहेत, काय करू?",
+  ],
+};
+
+// The conversation is kept in this browser so a page refresh doesn't wipe it.
+const CHAT_STORAGE_KEY = "cropiq.chat";
+const MAX_SAVED_MESSAGES = 60;
+
+const loadSavedChat = () => {
+  try {
+    const saved = JSON.parse(localStorage.getItem(CHAT_STORAGE_KEY));
+    return saved && Array.isArray(saved.messages) && saved.messages.length ? saved : null;
+  } catch {
+    return null;
+  }
+};
 
 // Custom icon component for consistency with theme
 const FaChartLine = ({ className }) => (
@@ -103,9 +147,32 @@ const Tooltip = ({ content }) => {
   );
 };
 
+// Full locales for the browser speech APIs and Google Cloud - bare codes like
+// "hi" are accepted inconsistently, "hi-IN" works everywhere.
+const VOICE_LOCALES = {
+  en: "en-US", hi: "hi-IN", mr: "mr-IN", gu: "gu-IN", pa: "pa-IN",
+  bn: "bn-IN", te: "te-IN", ta: "ta-IN", kn: "kn-IN", ml: "ml-IN",
+};
+const toLocale = (lang) => VOICE_LOCALES[lang] || "en-US";
+
+// Markdown symbols read out loud are noise ("asterisk asterisk...").
+const stripForSpeech = (text) =>
+  (text || "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]*)`/g, "$1")
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/^\s{0,3}#{1,6}\s*/gm, "")
+    .replace(/(\*\*|__|\*|_|~~)/g, "")
+    .replace(/^\s*[-*+]\s+/gm, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
 function ChatAssistant() {
   // TTS (Text-to-Speech) state
-  const [ttsEnabled, setTtsEnabled] = useState(true);
+  const [ttsEnabled] = useState(true);
+  const [autoRead, setAutoRead] = useState(false);   // read each new reply aloud
+  const [speakingIdx, setSpeakingIdx] = useState(null);
+  const serverAudioRef = useRef(null);               // audio element for server-side TTS
   // STT (Speech-to-Text) mode: 'browser' (Web Speech API) or 'upload' (record & send)
   const [sttMode, setSttMode] = useState(SpeechRecognition ? 'browser' : 'upload');
   const [recognitionActive, setRecognitionActive] = useState(false);
@@ -166,9 +233,9 @@ function ChatAssistant() {
       const isOgg = mimeType.includes('ogg');
       const formData = new FormData();
       formData.append('file', audioBlob, isOgg ? 'input.ogg' : 'input.webm');
-      formData.append('language', selectedLanguage);
+      formData.append('language', toLocale(selectedLanguage));
       formData.append('encoding', isOgg ? 'OGG_OPUS' : 'WEBM_OPUS');
-      const response = await fetch(`${API_BASE_URL}/chat/speech-chat`, {
+      const response = await fetch(`${API_BASE_URL}/chat/transcribe`, {
         method: 'POST',
         body: formData
       });
@@ -192,12 +259,12 @@ function ChatAssistant() {
         }
         return;
       }
-      if (!data.user_transcript) {
+      if (!data.transcript) {
         console.error("Speech chat: no transcript in response", data);
         setError("Didn't catch that clearly. Try recording again, or type your message.");
         return;
       }
-      setInput(data.user_transcript);
+      setInput(data.transcript);
       setSpeechCaptured(true);
       setTimeout(() => inputRef.current?.focus(), 100);
       // DO NOT send to AI automatically; user must review and click Send
@@ -227,25 +294,35 @@ function ChatAssistant() {
   const [input, setInput] = useState("");
   const [speechCaptured, setSpeechCaptured] = useState(false);
   const inputRef = useRef(null);
-  const [messages, setMessages] = useState([
-    {
-      role: "assistant",
-      content: "Welcome to CropIQ AI! I'm here to assist with all your agricultural needs - from crop management and weather insights to market trends and farming advice. How can I help your farm thrive today?"
-    }
-  ]);
+  const [messages, setMessages] = useState(() => loadSavedChat()?.messages || [WELCOME_MESSAGE]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [selectedLanguage, setSelectedLanguage] = useState("en");
+  const [selectedLanguage, setSelectedLanguage] = useState(() => loadSavedChat()?.language || "en");
   const [location, setLocation] = useState("");
-  const [latitude, setLatitude] = useState(19.2183);
-  const [longitude, setLongitude] = useState(73.8197);
+  // No default coordinates: a made-up starting point would silently ground
+  // every weather answer in that place for users who never set a location.
+  const [latitude, setLatitude] = useState(null);
+  const [longitude, setLongitude] = useState(null);
   const [autoLocationEnabled, setAutoLocationEnabled] = useState(false);
   const [gettingLocation, setGettingLocation] = useState(false);
   const [weather, setWeather] = useState(null);
   const [gettingWeather, setGettingWeather] = useState(false);
   const [showMap, setShowMap] = useState(false);
   const [locationSelected, setLocationSelected] = useState(false);
-  const [sessionId, setSessionId] = useState(null);
+  const [sessionId, setSessionId] = useState(() => loadSavedChat()?.sessionId || null);
+
+  // Save the conversation on every change (errors aren't worth keeping)
+  useEffect(() => {
+    try {
+      localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify({
+        messages: messages.filter((m) => m.role !== "error").slice(-MAX_SAVED_MESSAGES),
+        sessionId,
+        language: selectedLanguage,
+      }));
+    } catch {
+      /* storage unavailable - the chat just won't survive a refresh */
+    }
+  }, [messages, sessionId, selectedLanguage]);
   const chatEndRef = useRef(null);
 
   const formatLocationLabel = useCallback((addressData, fallbackLat, fallbackLng) => {
@@ -297,15 +374,59 @@ function ChatAssistant() {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // TTS: Speak text using browser API
-  function speakText(text) {
-    if (!synth || !ttsEnabled) return;
-    synth.cancel(); // stop any previous
-    const utter = new window.SpeechSynthesisUtterance(text);
-    utter.lang = selectedLanguage === 'en' ? 'en-US' : selectedLanguage;
-    utter.rate = 1.05;
-    synth.speak(utter);
-  }
+  // TTS: stop whatever is currently being read
+  const stopSpeaking = () => {
+    if (synth) synth.cancel();
+    if (serverAudioRef.current) {
+      serverAudioRef.current.pause();
+      serverAudioRef.current = null;
+    }
+    setSpeakingIdx(null);
+  };
+
+  // TTS: read text aloud. Uses the browser's own voice when the device has
+  // one for the selected language; otherwise (common for Hindi, Marathi, etc.
+  // on desktop) falls back to the server's /chat/text-to-speech.
+  const speakText = async (rawText, idx = null) => {
+    if (!ttsEnabled) return;
+    const text = stripForSpeech(rawText);
+    if (!text) return;
+    stopSpeaking();
+    setSpeakingIdx(idx);
+    const locale = toLocale(selectedLanguage);
+    const prefix = locale.split("-")[0].toLowerCase();
+
+    const voices = synth ? synth.getVoices() : [];
+    const hasVoice = voices.some(v => v.lang && v.lang.toLowerCase().startsWith(prefix));
+    if (synth && (hasVoice || prefix === "en")) {
+      const utter = new window.SpeechSynthesisUtterance(text);
+      utter.lang = locale;
+      utter.rate = 1.0;
+      utter.onend = () => setSpeakingIdx(null);
+      utter.onerror = () => setSpeakingIdx(null);
+      synth.speak(utter);
+      return;
+    }
+
+    try {
+      const res = await fetch(`${API_BASE_URL}/chat/text-to-speech`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, language: prefix }),
+      });
+      if (!res.ok) throw new Error(`TTS failed (${res.status})`);
+      const url = URL.createObjectURL(await res.blob());
+      const audio = new Audio(url);
+      serverAudioRef.current = audio;
+      audio.onended = () => { setSpeakingIdx(null); URL.revokeObjectURL(url); };
+      audio.onerror = () => { setSpeakingIdx(null); URL.revokeObjectURL(url); };
+      await audio.play();
+    } catch (err) {
+      console.error("Text-to-speech failed:", err);
+      setSpeakingIdx(null);
+      setError("Couldn't read that aloud right now.");
+    }
+  };
 
   // STT: Start browser speech recognition
   const handleStartRecognition = () => {
@@ -319,7 +440,7 @@ function ChatAssistant() {
     setError("");
     setRecognitionActive(true);
     const recognition = new SpeechRecognition();
-    recognition.lang = selectedLanguage === 'en' ? 'en-US' : selectedLanguage;
+    recognition.lang = toLocale(selectedLanguage);
     recognition.interimResults = true;
     recognition.continuous = false;
     recognitionRef.current = recognition;
@@ -386,14 +507,16 @@ function ChatAssistant() {
     }
   };
 
-  const handleSend = async (e) => {
-    e.preventDefault();
-    if (!input.trim()) return;
-    
+  // Send `text` as the user's next message - from the input box, a starter
+  // question or a suggested follow-up.
+  const sendMessage = async (text) => {
+    const message = (text || "").trim();
+    if (!message || loading) return;
+
     setError("");
     setLoading(true);
-    
-    const newMessages = [...messages, { role: "user", content: input }];
+
+    const newMessages = [...messages, { role: "user", content: message }];
     setMessages(newMessages);
     setInput("");
     setSpeechCaptured(false);
@@ -402,14 +525,14 @@ function ChatAssistant() {
       // One unified chat API handles every language - it used to branch to
       // a separate multilingual endpoint with its own (weaker) implementation.
       const data = await chatAssistantApi({
-        message: input,
+        message,
         history: messages
           .filter((m, index) => !(index === 0 && m.role === 'assistant'))
           .filter(m => m.role !== 'error')
           .map(m => ({ role: m.role, content: m.content })),
-        location: location,
-        latitude: latitude,
-        longitude: longitude,
+        location: location || null,
+        latitude: latitude ?? null,
+        longitude: longitude ?? null,
         session_id: sessionId,
         language: selectedLanguage
       });
@@ -419,7 +542,13 @@ function ChatAssistant() {
         setSessionId(data.session_id);
       }
 
-      setMessages([...newMessages, { role: "assistant", content: data.response || "(No response)" }]);
+      setMessages([...newMessages, {
+        role: "assistant",
+        content: data.response || "(No response)",
+        sources: data.sources || null,
+        suggestions: data.suggestions || [],
+      }]);
+      if (autoRead && data.response) speakText(data.response, newMessages.length);
     } catch (error) {
       console.error("Chat request failed:", error);
       const errorMsg = error?.message || "Unable to reach the chat service.";
@@ -437,6 +566,18 @@ function ChatAssistant() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleSend = (e) => {
+    e?.preventDefault?.();
+    sendMessage(input);
+  };
+
+  const handleNewChat = () => {
+    stopSpeaking();
+    setMessages([WELCOME_MESSAGE]);
+    setSessionId(null);
+    setError("");
   };
 
   const handleShare = () => {
@@ -782,6 +923,38 @@ function ChatAssistant() {
                   )}
                 </div>
 
+                <select
+                  value={selectedLanguage}
+                  onChange={handleLanguageChange}
+                  className="px-2 py-2 text-sm border border-gray-200 rounded-lg bg-white text-gray-700 focus:outline-none focus:ring-2 focus:ring-green-200"
+                  aria-label="Chat language"
+                  title="Chat language (also used for voice input and read aloud)"
+                >
+                  {languageOptions.map(l => (
+                    <option key={l.value} value={l.value}>{l.label}</option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={() => { if (autoRead) stopSpeaking(); setAutoRead(!autoRead); }}
+                  className={`flex items-center px-3 py-2 text-sm rounded-lg border transition-colors ${
+                    autoRead ? "bg-amber-100 border-amber-300 text-amber-800" : "bg-white border-gray-200 text-gray-600 hover:bg-gray-50"
+                  }`}
+                  aria-pressed={autoRead}
+                  title="Read each new reply aloud automatically"
+                >
+                  <FaVolumeUp className="mr-2" />
+                  Auto-read {autoRead ? "on" : "off"}
+                </button>
+                <button
+                  onClick={handleNewChat}
+                  className="flex items-center px-3 py-2 text-sm bg-white hover:bg-green-50 text-green-700 border border-green-200 rounded-lg transition-colors focus:outline-none focus:ring-2 focus:ring-green-300"
+                  aria-label="Start a new chat"
+                  title="Start a new chat"
+                >
+                  <FaPlus className="mr-2" />
+                  New chat
+                </button>
                 <button
                   onClick={handleShare}
                   className="flex items-center px-3 py-2 text-sm bg-green-600 hover:bg-green-700 text-white rounded-lg transition-colors focus:outline-none focus:ring-2 focus:ring-green-300"
@@ -855,15 +1028,18 @@ function ChatAssistant() {
                           ),
                         }}
                       />
+                      {msg.role === "assistant" && <SourceCitations sources={msg.sources} />}
                       {/* Read Aloud button for AI responses */}
                       {msg.role === "assistant" && (
                         <button
                           className="mt-2 ml-2 px-3 py-1 bg-amber-100 hover:bg-amber-200 text-amber-800 text-xs rounded-md flex items-center transition-colors"
-                          onClick={() => speakText(msg.content)}
-                          aria-label="Read aloud"
-                          title="Read aloud"
+                          onClick={() => (speakingIdx === idx ? stopSpeaking() : speakText(msg.content, idx))}
+                          aria-label={speakingIdx === idx ? "Stop reading" : "Read aloud"}
+                          title={speakingIdx === idx ? "Stop reading" : "Read aloud"}
                         >
-                          <FaMicrophone className="mr-1 text-amber-600" /> Read Aloud
+                          {speakingIdx === idx
+                            ? <><FaStopCircle className="mr-1 text-amber-600" /> Stop</>
+                            : <><FaVolumeUp className="mr-1 text-amber-600" /> Read Aloud</>}
                         </button>
                       )}
                       {msg.retry && (
@@ -883,6 +1059,30 @@ function ChatAssistant() {
                   </div>
                 </FadeInSection>
               ))}
+              {!loading && (() => {
+                const hasUserMessage = messages.some((m) => m.role === "user");
+                const last = messages[messages.length - 1];
+                const chips = !hasUserMessage
+                  ? STARTER_QUESTIONS[selectedLanguage] || STARTER_QUESTIONS.en
+                  : last?.role === "assistant"
+                  ? last.suggestions || []
+                  : [];
+                if (!chips.length) return null;
+                return (
+                  <div className="flex flex-wrap gap-2 pl-10" aria-label={hasUserMessage ? "Suggested follow-up questions" : "Suggested questions"}>
+                    {chips.map((q) => (
+                      <button
+                        key={q}
+                        type="button"
+                        onClick={() => sendMessage(q)}
+                        className="px-3 py-1.5 text-xs rounded-full bg-white border border-green-200 text-green-800 hover:bg-green-50 hover:border-green-300 transition-colors text-left"
+                      >
+                        {q}
+                      </button>
+                    ))}
+                  </div>
+                );
+              })()}
             </div>
             <div ref={chatEndRef} />
 
@@ -996,6 +1196,60 @@ function ChatAssistant() {
         </div>
       </FadeInSection>
     </div>
+    </div>
+  );
+}
+
+// Provenance label under an AI answer: "From RAG" when the KCC archive had
+// relevant matches, otherwise "From Gemini" with the web citations it used.
+const SOURCE_STYLES = {
+  rag: "bg-emerald-50 text-emerald-800 border-emerald-200",
+  gemini: "bg-blue-50 text-blue-800 border-blue-200",
+  live_data: "bg-amber-50 text-amber-800 border-amber-200",
+};
+
+function SourceCitations({ sources }) {
+  if (!sources || !sources.label) return null;
+  const archive = sources.citations || [];
+  const web = sources.web || [];
+  const style = SOURCE_STYLES[sources.type] || SOURCE_STYLES.gemini;
+  return (
+    <div className="mt-3 pt-2 border-t border-gray-100 text-xs">
+      <span className={`inline-block px-2 py-0.5 rounded-full border font-medium ${style}`}>
+        {sources.label}
+      </span>
+      {archive.length > 0 && (
+        <details className="mt-2">
+          <summary className="cursor-pointer text-gray-500 hover:text-gray-700 select-none">
+            KCC archive ({archive.length})
+          </summary>
+          <ol className="mt-1 space-y-1.5 list-decimal pl-5 text-gray-600">
+            {archive.map((c, i) => (
+              <li key={i}>
+                <span className="font-medium text-gray-700">{c.title}</span>
+                {c.crop ? <span className="ml-1 text-gray-400">({c.crop})</span> : null}
+                {c.snippet ? <div className="text-gray-500">{c.snippet}</div> : null}
+              </li>
+            ))}
+          </ol>
+        </details>
+      )}
+      {web.length > 0 && (
+        <details className="mt-2">
+          <summary className="cursor-pointer text-gray-500 hover:text-gray-700 select-none">
+            Web sources ({web.length})
+          </summary>
+          <ol className="mt-1 space-y-1 list-decimal pl-5">
+            {web.map((c, i) => (
+              <li key={i}>
+                <a href={c.url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline break-words">
+                  {c.title || c.url}
+                </a>
+              </li>
+            ))}
+          </ol>
+        </details>
+      )}
     </div>
   );
 }

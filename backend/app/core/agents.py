@@ -20,7 +20,10 @@ from app.core.ai_services import (
 )
 from app.models.yield_model import YieldInput
 from app.services.yield_prediction_service import predict_yield
-from app.services.market_scraper import get_all_prices, get_scraper, record_todays_snapshot_if_needed, get_local_price_history
+from app.services.market_scraper import (
+    get_all_prices, get_scraper, record_todays_snapshot_if_needed, get_local_price_history,
+)
+from app.services.market_insights import analyze_trend_signal, TREND_THRESHOLD_PCT
 from app.core.config import get_settings
 
 # Initialize settings
@@ -166,7 +169,7 @@ class YieldPredictorAgent(Agent):
                 defaults.update(raw_input)
                 yield_input = YieldInput(**defaults)
 
-            yield_per_hectare, total_production, recommendations, model_source, model_r2 = predict_yield(yield_input)
+            yield_per_hectare, total_production, recommendations, model_source, model_r2 = await asyncio.to_thread(predict_yield, yield_input)
             result = (
                 f"Estimated yield for {yield_input.crop} in {yield_input.state} ({yield_input.season}): "
                 f"{yield_per_hectare:.2f} tonnes/hectare, ~{total_production:.2f} tonnes total "
@@ -305,7 +308,8 @@ class MarketAnalyzerAgent(Agent):
             # snapshot gives us for free, so day one still shows a real
             # 2-point trend instead of a single dot.
             matches = await get_scraper().get_prices(crop)
-            record = matches[0] if matches else None
+            # Exact name first ("Gram" would otherwise pick whichever gram came first)
+            record = next((m for m in matches if m["crop"].lower() == crop.lower()), matches[0] if matches else None)
             if record and record.get("price_1d_ago") is not None:
                 today_date = record["date"]
                 yesterday_date = (datetime.strptime(today_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -316,10 +320,13 @@ class MarketAnalyzerAgent(Agent):
                         key=lambda h: h["date"]
                     )
 
+            msp = record.get("msp_price") if record else None
+            signal = analyze_trend_signal(historical_prices, msp=msp)
+
             if len(historical_prices) >= 2:
-                start_price = historical_prices[0]["price"]
-                end_price = historical_prices[-1]["price"]
-                trend_percentage = ((end_price - start_price) / start_price) * 100
+                # Same smoothed figure the trend badge shows, so the summary
+                # text and the badge never disagree.
+                trend_percentage = signal["trend_score"]
                 span_days = len(historical_prices)
                 span = f"{historical_prices[0]['date']} to {historical_prices[-1]['date']}"
 
@@ -329,9 +336,9 @@ class MarketAnalyzerAgent(Agent):
                     "real recorded days so far rather than a full 30 - it'll keep growing.)"
                 )
 
-                if trend_percentage > 5:
+                if trend_percentage > TREND_THRESHOLD_PCT:
                     trend_summary = f"Prices for {crop} have risen by approximately {trend_percentage:.1f}% ({span}).{coverage_note}"
-                elif trend_percentage < -5:
+                elif trend_percentage < -TREND_THRESHOLD_PCT:
                     trend_summary = f"Prices for {crop} have fallen by approximately {abs(trend_percentage):.1f}% ({span}).{coverage_note}"
                 else:
                     trend_summary = f"Prices for {crop} have stayed relatively stable (change of {trend_percentage:.1f}%, {span}).{coverage_note}"
@@ -360,8 +367,11 @@ class MarketAnalyzerAgent(Agent):
                 sender=self.agent_type,
                 receiver=message.sender,
                 content={
-                    "message": trend_summary, 
-                    "historical_data": historical_prices
+                    "message": trend_summary,
+                    "historical_data": historical_prices,
+                    "msp": msp,
+                    "current_price": record.get("price_per_quintal") if record else None,
+                    **signal,
                 },
                 message_type="trend_analysis_result",
                 context=message.context

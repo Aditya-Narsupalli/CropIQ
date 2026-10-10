@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends, Query, Header
 from app.core.ai_services import get_market_summary_ai
 from app.services.market_scraper import get_all_prices, get_scraper, record_todays_snapshot_if_needed
+from app.services.market_insights import get_market_insights as compute_market_insights
 from app.core.multi_agent import AgentType, Message, coordinator, context_protocol
 from app.core.config import get_settings
 import uuid
@@ -211,12 +212,24 @@ async def get_market_trends(crop: str = Query(..., description="Commodity name, 
             error = message.content.get("error", "Unknown error analyzing trends") if message else "No response from market agent"
             raise HTTPException(status_code=500, detail=error)
             
-        # Return both the trend message and the historical data
-        return {
-            "message": message.content.get("message", "No trend data available"),
-            "historical_data": message.content.get("historical_data", [])
-        }
+        # Trend summary, real recorded history, and the trend signal
+        # (trend_score/trend_label/confidence/advisory/range...) the Market
+        # page renders - previously dropped here, so the UI never showed it.
+        content = dict(message.content)
+        content.setdefault("message", "No trend data available")
+        content.setdefault("historical_data", [])
+        return content
         
     except Exception as e:
         print(f"Error analyzing market trends: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/insights", status_code=200)
+async def get_market_insights():
+    """Today's biggest price movers and every commodity's price vs its MSP,
+    from the live Agmarknet feed."""
+    try:
+        return await compute_market_insights()
+    except Exception as e:
+        logger.error(f"Error computing market insights: {e}")
+        raise HTTPException(status_code=500, detail="Market insights are unavailable right now.")
