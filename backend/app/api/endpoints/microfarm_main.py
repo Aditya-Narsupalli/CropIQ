@@ -17,12 +17,23 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(script_dir))
 models_dir = os.path.join(project_root, 'models')
 data_dir = os.path.join(project_root, 'data')
-# Load the trained model
-model_path = os.path.join(models_dir, 'model.pkl')
-print(f"Loading model from {model_path}")
-with open(model_path, "rb") as f:
-    model = pickle.load(f)
-    
+# The trained ROI model, in XGBoost's native format, loaded on first use.
+# (Previously a pickled XGBRegressor loaded at import: unpickling that
+# wrapper needs scikit-learn, which costs ~60 MB of RAM on a 512 MB server
+# for no runtime benefit. The Booster gives identical predictions.)
+model_path = os.path.join(models_dir, 'microfarm_xgb_model.json')
+_model = None
+
+
+def _predict_roi(X: pd.DataFrame) -> float:
+    global _model
+    import xgboost as xgb
+    if _model is None:
+        _model = xgb.Booster()
+        _model.load_model(model_path)
+    return float(_model.predict(xgb.DMatrix(X))[0])
+
+
 # Load model metadata to get features
 meta_path = os.path.join(models_dir, 'model_meta.pkl')
 with open(meta_path, "rb") as f:
@@ -421,7 +432,7 @@ async def recommend_system(data: RecommendationRequest):
                 if set(input_features.keys()).issubset(set(model_features)):
                     # Create feature vector as expected by model
                     X = pd.DataFrame([input_features])[model_features]
-                    predicted_roi = model.predict(X)[0]
+                    predicted_roi = _predict_roi(X)
                     print(f"Model predicted ROI for {system['system']}: {predicted_roi:.2f}%")
                     expected_roi = predicted_roi
                 else:

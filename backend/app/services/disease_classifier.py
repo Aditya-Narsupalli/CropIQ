@@ -53,7 +53,13 @@ def _load() -> bool:
         return True
     try:
         import onnxruntime as ort
-        _session = ort.InferenceSession(BACKBONE_PATH, providers=["CPUExecutionProvider"])
+        # Keep memory low on a 512 MB server: no persistent memory arena or
+        # pre-planned buffers between requests, and few threads.
+        opts = ort.SessionOptions()
+        opts.enable_cpu_mem_arena = False
+        opts.enable_mem_pattern = False
+        opts.intra_op_num_threads = 2
+        _session = ort.InferenceSession(BACKBONE_PATH, sess_options=opts, providers=["CPUExecutionProvider"])
         with open(HEAD_PATH, encoding="utf-8") as f:
             head = json.load(f)
         _head = {
@@ -82,7 +88,11 @@ def supported_crops() -> List[str]:
 
 
 def _preprocess(image_bytes: bytes) -> np.ndarray:
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    img = Image.open(io.BytesIO(image_bytes))
+    # JPEGs decode straight to a reduced size (a 12 MP phone photo would
+    # otherwise take ~36 MB as raw pixels) - the model only needs 224 px.
+    img.draft("RGB", (512, 512))
+    img = img.convert("RGB")
     w, h = img.size
     s = 256 / min(w, h)
     img = img.resize((max(224, round(w * s)), max(224, round(h * s))), Image.BICUBIC)

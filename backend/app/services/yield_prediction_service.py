@@ -27,8 +27,11 @@ _YIELD_META_PATH = os.path.join(_models_dir, "yield_model_meta.pkl")
 yield_model = None
 yield_meta = None
 try:
-    from xgboost import XGBRegressor
-    yield_model = XGBRegressor()
+    import xgboost as xgb
+    # The core Booster rather than the XGBRegressor wrapper: same model and
+    # predictions, but the wrapper needs scikit-learn installed (~60 MB of
+    # RAM), which matters on a 512 MB server.
+    yield_model = xgb.Booster()
     yield_model.load_model(_YIELD_MODEL_PATH)  # native format: robust across machines/xgboost versions
     yield_meta = joblib.load(_YIELD_META_PATH)
     if yield_meta.get("version", 1) < 2:
@@ -458,7 +461,8 @@ def get_ml_yield_estimate(crop: str, state: str, season: str, district: Optional
     X = pd.DataFrame([row])
     for col in yield_meta["features"]:
         X[col] = pd.Categorical(X[col], categories=categories[col])
-    yield_per_hectare = max(float(np.expm1(yield_model.predict(X[yield_meta["features"]])[0])), 0.05)
+    dmatrix = xgb.DMatrix(X[yield_meta["features"]], enable_categorical=True)
+    yield_per_hectare = max(float(np.expm1(yield_model.predict(dmatrix)[0])), 0.05)
 
     range_key = "known_district" if resolved_district else "unknown_district"
     return {

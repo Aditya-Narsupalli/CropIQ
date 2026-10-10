@@ -19,7 +19,8 @@ python-multipart>=0.0.9            # File uploads for FastAPI
 numpy>=1.24.0,<2.0.0               # Numerical operations for yield prediction
 pandas
 xgboost
-scikit-learn                       # LabelEncoder + train/test split for yield & microfarm ROI models
+# scikit-learn is training-only (see requirements-train.txt). Keeping it off the
+# server saves ~60 MB of RAM: xgboost imports it automatically when installed.
 joblib                              # Model (de)serialization
 onnxruntime>=1.17,<2                # Runs the trained disease classifier (DINOv2 backbone, no PyTorch needed)
 

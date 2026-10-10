@@ -1,0 +1,8 @@
+# Extra packages for the offline training scripts in app/models/
+# (train_yield_model.py, train_agronomy_effects.py, train_disease_model.py,
+# microfarm_train_model.py). Not needed - and deliberately not installed - on
+# the server, where scikit-learn alone would cost ~60 MB of RAM.
+-r requirements.txt
+scikit-learn
+pyarrow     # reading the parquet datasets used by train_disease_model.py
+xlrd        # reading the ICRISAT .xls source in train_agronomy_effects.py

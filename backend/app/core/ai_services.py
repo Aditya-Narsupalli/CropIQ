@@ -159,7 +159,19 @@ async def _generate_with_fallback(
             return await _attempt(gemini_fallback_model_name, 1, allow_search=True)
         except Exception as e2:
             category2 = _classify_error(str(e2))
-            if not include_safety_net or not gemini_safety_net_model_name or category2 not in ("quota_exhausted", "rate_limited"):
+            if category2 not in ("quota_exhausted", "rate_limited"):
+                raise
+            if use_search:
+                # Google Search grounding has its own, smaller free-tier
+                # quota. When it's used up, the same request without search
+                # usually still works - an answer without web citations
+                # beats no answer at all.
+                try:
+                    return await _attempt(gemini_fallback_model_name, 1, allow_search=False)
+                except Exception as e3:
+                    if _classify_error(str(e3)) not in ("quota_exhausted", "rate_limited"):
+                        raise
+            if not include_safety_net or not gemini_safety_net_model_name:
                 raise
             # Search grounding is skipped on the safety-net tier: it's
             # typically an open Gemma model, which doesn't support Gemini's
@@ -244,6 +256,11 @@ async def get_disease_prediction(
         # types.Part, or types.File are accepted. Passing types.Image silently failed
         # on every single request, which is why disease detection was never working.
         pil_img = PILImage.open(io.BytesIO(image_bytes))
+        # Phone photos can be 12+ MP; 1280 px is plenty for diagnosis and
+        # cuts memory, upload size and Gemini tokens.
+        pil_img.draft("RGB", (1280, 1280))
+        pil_img = pil_img.convert("RGB")
+        pil_img.thumbnail((1280, 1280))
         location_context = location if location else "India"
         prompt = f"""You are an expert agricultural pathologist analyzing crop diseases in India.
 

@@ -86,7 +86,6 @@ async def text_to_speech(text: str = Body(..., embed=True), language: str = Body
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"TTS error: {e}")
 
-from google.cloud import speech, texttospeech
 import base64
 import os
 
@@ -95,6 +94,7 @@ async def stt(file: UploadFile = File(...), language: str = Body("en-US", embed=
     """
     Accepts an audio file and returns the transcript using Google Cloud Speech-to-Text.
     """
+    from google.cloud import speech  # loaded on use: ~12 MB of RAM
     client = speech.SpeechClient()
     audio_content = await file.read()
     audio = speech.RecognitionAudio(content=audio_content)
@@ -134,6 +134,7 @@ async def transcribe(
     """Speech -> text only. This is what the mic's record-and-upload fallback
     uses: unlike /speech-chat it doesn't also run a full Gemini answer and
     text-to-speech that the UI would just throw away."""
+    from google.cloud import speech  # loaded on use: ~12 MB of RAM
     encoding_map = {
         "WEBM_OPUS": speech.RecognitionConfig.AudioEncoding.WEBM_OPUS,
         "OGG_OPUS": speech.RecognitionConfig.AudioEncoding.OGG_OPUS,
@@ -178,6 +179,7 @@ async def speech_chat(
     default, never raw LINEAR16/WAV, so the STT config must match or Google
     Cloud will fail to decode it.
     """
+    from google.cloud import speech, texttospeech  # loaded on use: ~12 MB of RAM
     encoding_map = {
         "WEBM_OPUS": speech.RecognitionConfig.AudioEncoding.WEBM_OPUS,
         "OGG_OPUS": speech.RecognitionConfig.AudioEncoding.OGG_OPUS,
