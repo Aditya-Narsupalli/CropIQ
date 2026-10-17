@@ -12,6 +12,8 @@ import {
   Tooltip,
   Legend,
   ResponsiveContainer,
+  ReferenceLine,
+  LabelList,
 } from "recharts";
 import {
   FaChartBar,
@@ -22,6 +24,9 @@ import {
   FaTimes,
 } from "react-icons/fa";
 import { GiWheat } from "react-icons/gi";
+import {
+  MarketInsightsPanel, PriceRangeBar, HarvestValueCalculator, WatchlistPanel, PriceComparisonChart,
+} from "./MarketInsights";
 
 const MarketView = () => {
   const [marketData, setMarketData] = useState([]);
@@ -123,14 +128,14 @@ const MarketView = () => {
       if (data && typeof data === "object") {
         setTrendData(data.message || "No trend summary available.");
         setHistoricalPriceData(data.historical_data || []);
-        if (data.confidence && data.confidence !== "none") {
-          setTrendSignal({
-            score: data.trend_score,
-            label: data.trend_label,
-            confidence: data.confidence,
-            advisory: data.advisory,
-          });
-        }
+        // Kept even with too little history for a trend label, so the
+        // MSP and harvest calculator still work for that crop.
+        setTrendSignal({
+          ...data,
+          score: data.trend_score,
+          label: data.trend_label,
+          hasTrend: Boolean(data.confidence && data.confidence !== "none"),
+        });
       } else {
         setTrendData("Error: Unexpected API response format.");
         setHistoricalPriceData([]);
@@ -141,6 +146,12 @@ const MarketView = () => {
     }
 
     setIsFetchingCrop(false);
+  };
+
+  // Open a crop's trend analysis and bring it into view
+  const openTrend = (crop) => {
+    fetchTrendData(crop);
+    document.getElementById("market-trend-card")?.scrollIntoView({ behavior: "smooth", block: "start" });
   };
 
   const sortMarketData = () => {
@@ -160,6 +171,14 @@ const MarketView = () => {
   const filteredMarketData = marketData.filter((item) =>
     item.crop.toLowerCase().includes(filterValue.toLowerCase())
   );
+
+  // Short display names for the chart ("Bajra(Pearl Millet/Cumbu)" -> "Bajra")
+  const shortCropName = (name) => name.split("(")[0].split("/")[0].trim();
+  const pricedChartData = filteredMarketData
+    .filter((item) => item.price_per_quintal)
+    .map((item) => ({ ...item, label: shortCropName(item.crop) }))
+    .sort((a, b) => b.price_per_quintal - a.price_per_quintal);
+  const unpricedCrops = filteredMarketData.filter((item) => !item.price_per_quintal).map((item) => item.crop);
 
   const indexOfLastItem = currentPage * itemsPerPage;
   const indexOfFirstItem = indexOfLastItem - itemsPerPage;
@@ -322,6 +341,9 @@ const MarketView = () => {
               </div>
             </div>
           ) : (
+            <>
+            <WatchlistPanel marketData={marketData} onSelectCrop={openTrend} />
+            <MarketInsightsPanel onSelectCrop={openTrend} />
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
               {/* Left Column - Market Data */}
               <div className="space-y-6">
@@ -363,40 +385,38 @@ const MarketView = () => {
                     />
                   </div>
 
-                  <ResponsiveContainer width="100%" height={300}>
+                  {/* Horizontal bars: one readable row per crop, however many
+                      there are, sorted by price with the value printed so
+                      low-priced crops (e.g. potato) stay visible next to
+                      high-priced ones (e.g. copra). */}
+                  <ResponsiveContainer width="100%" height={Math.max(160, pricedChartData.length * 26 + 30)}>
                     <BarChart
-                      data={filteredMarketData}
-                      margin={{
-                        top: 5,
-                        right: 30,
-                        left: 20,
-                        bottom: 5,
-                      }}
+                      data={pricedChartData}
+                      layout="vertical"
+                      margin={{ top: 5, right: 60, left: 5, bottom: 5 }}
                     >
-                      <CartesianGrid strokeDasharray="3 3" />
-                      <XAxis
-                        dataKey="crop"
-                        angle={-15}
-                        textAnchor="end"
-                        height={60}
-                        interval={0}
-                        fontSize={10}
+                      <CartesianGrid strokeDasharray="3 3" horizontal={false} />
+                      <XAxis type="number" fontSize={10} tickFormatter={(v) => `₹${(v / 1000).toFixed(0)}k`} />
+                      <YAxis type="category" dataKey="label" width={95} interval={0} fontSize={11} />
+                      <Tooltip
+                        formatter={(value) => [`₹${Math.round(value).toLocaleString("en-IN")}`, t("pricePerQuintal")]}
+                        labelFormatter={(label, payload) => payload?.[0]?.payload?.crop || label}
                       />
-                      <YAxis />
-                      <Tooltip formatter={(value) => [`₹${value}`, "Price"]} />
-                      <Legend />
-                      <Bar
-                        dataKey="price_per_quintal"
-                        fill="#10B981"
-                        name={t("pricePerQuintal")}
-                      />
-                      <Bar
-                        dataKey="price_per_tonne"
-                        fill="#3B82F6"
-                        name={t("pricePerTonne")}
-                      />
+                      <Bar dataKey="price_per_quintal" fill="#10B981" name={t("pricePerQuintal")} barSize={16}>
+                        <LabelList
+                          dataKey="price_per_quintal"
+                          position="right"
+                          fontSize={10}
+                          formatter={(v) => `₹${Math.round(v).toLocaleString("en-IN")}`}
+                        />
+                      </Bar>
                     </BarChart>
                   </ResponsiveContainer>
+                  {unpricedCrops.length > 0 && (
+                    <p className="text-xs text-gray-500 mt-2">
+                      No price reported today: {unpricedCrops.join(", ")}
+                    </p>
+                  )}
                 </div>
 
                 {/* Market Data Table Card */}
@@ -581,7 +601,7 @@ const MarketView = () => {
               {/* Right Column - Trend Analysis */}
               <div className="space-y-6">
                 {/* Trend Analysis Card */}
-                <div className="bg-white p-6 rounded-lg shadow-sm border border-amber-100">
+                <div id="market-trend-card" className="bg-white p-6 rounded-lg shadow-sm border border-amber-100 scroll-mt-24">
                   <h3 className="font-semibold text-lg text-gray-800 mb-4 flex items-center">
                     <FaChartLine className="mr-2 text-green-500" />
                     Market Trend Analysis
@@ -620,7 +640,7 @@ const MarketView = () => {
                         <p className="text-gray-700">{trendData}</p>
                       )}
 
-                      {trendSignal && !isFetchingCrop && (
+                      {trendSignal?.hasTrend && !isFetchingCrop && (
                         <div className="mt-3 p-3 bg-white rounded-lg border border-gray-200">
                           <div className="flex items-center gap-2 mb-2">
                             <span
@@ -640,6 +660,7 @@ const MarketView = () => {
                             </span>
                           </div>
                           <p className="text-xs text-gray-600">{trendSignal.advisory}</p>
+                          <PriceRangeBar signal={trendSignal} msp={trendSignal.msp} />
                         </div>
                       )}
 
@@ -647,7 +668,7 @@ const MarketView = () => {
                       {historicalPriceData.length > 0 && !isFetchingCrop && (
                         <div className="mt-4">
                           <h5 className="font-semibold text-blue-700 mb-2 text-sm">
-                            Price Trend (Real Recorded Days)
+                            Price Trend
                           </h5>
                           <div className="h-64">
                             <ResponsiveContainer width="100%" height="100%">
@@ -684,10 +705,27 @@ const MarketView = () => {
                                   activeDot={{ r: 8 }}
                                   name="Price"
                                 />
+                                {trendSignal?.msp && (
+                                  <ReferenceLine
+                                    y={trendSignal.msp}
+                                    stroke="#b45309"
+                                    strokeDasharray="4 4"
+                                    label={{ value: `MSP ₹${Math.round(trendSignal.msp)}`, position: "insideTopRight", fontSize: 10, fill: "#b45309" }}
+                                  />
+                                )}
                               </LineChart>
                             </ResponsiveContainer>
                           </div>
                         </div>
+                      )}
+
+                      {trendSignal && !isFetchingCrop && (
+                        <HarvestValueCalculator
+                          crop={selectedCrop}
+                          currentPrice={trendSignal.current_price}
+                          msp={trendSignal.msp}
+                          signal={trendSignal.hasTrend ? trendSignal : null}
+                        />
                       )}
 
                       {/* Market Alerts - uses the REAL day-over-day change
@@ -761,6 +799,8 @@ const MarketView = () => {
                     meantime. */}
               </div>
             </div>
+            <PriceComparisonChart marketData={marketData} />
+            </>
           )}
         </div>
       </div>

@@ -1,11 +1,15 @@
-﻿# backend/app/api/endpoints/disease.py
+# backend/app/api/endpoints/disease.py
 
 import logging
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Form
 from PIL import UnidentifiedImageError # Specific error if PIL can't open image
 
 # Import AI service, config, and response model
+import asyncio
+
 from app.core.ai_services import get_disease_prediction
+from app.services.disease_classifier import classify, model_crop
+from app.services.kcc_archive import disease_references
 from app.core.config import get_settings, Settings
 from app.models.disease_model import DiseaseResponse
 
@@ -105,19 +109,53 @@ async def detect_crop_disease(
     try:
         logger.info(f"Sending image '{file.filename}' to AI service...")
         # Call the asynchronous function from ai_services with context
-        prediction_result = await get_disease_prediction(image_bytes, crop_type, location)
+        # Trained classifier first (crops it covers), then Gemini for the full
+        # write-up, given the classifier's finding as evidence.
+        try:
+            finding = await asyncio.to_thread(classify, image_bytes, crop_type)
+        except Exception as e:
+            logger.warning(f"Disease classifier failed, continuing with Gemini only: {e}")
+            finding = None
+        # Real expert answers from the Kisan Call Centre archive for the
+        # disease the model found - grounds the treatment advice.
+        references = []
+        if finding and finding["confident"]:
+            references = await asyncio.to_thread(disease_references, finding["crop"], finding["disease"])
+        prediction_result = await get_disease_prediction(
+            image_bytes, crop_type, location, model_finding=finding, references=references,
+        )
         logger.info(f"Received AI analysis successfully for '{file.filename}'.")
 
-        # Optional: Check if the AI service itself indicated an issue in its text response
-        if prediction_result.startswith("Error:"):
+        gemini_failed = prediction_result.startswith("Error")
+
+        # Crops the trained model doesn't cover: look up the disease Gemini
+        # identified, so every crop gets Kisan Call Centre expert answers.
+        if not references and not gemini_failed:
+            identified = _identification(prediction_result)
+            if identified:
+                references = await asyncio.to_thread(
+                    disease_references, model_crop(crop_type) or crop_type.strip().title(), identified,
+                )
+        if gemini_failed and not finding:
             logger.error(f"AI Service returned an error message for '{file.filename}': {prediction_result}")
             # Propagate the error from the service, indicating the service had an issue
-            raise HTTPException(status_code=503, detail=prediction_result) # 503 Service Unavailable
+            # Don't show the farmer the provider's raw error text (quota details etc.)
+            raise HTTPException(
+                status_code=503,
+                detail="Photo analysis is temporarily unavailable (the AI service is busy or has reached its "
+                       "daily limit). Please try again later.",
+            )
+        if gemini_failed:
+            # Gemini down (e.g. quota) - the trained model's answer still stands
+            prediction_result = _model_only_analysis(finding)
 
         # 4. Return Successful Response using the Pydantic model
         return DiseaseResponse(
             analysis=prediction_result,
-            filename=file.filename or "unknown_filename" # Provide a default if filename is None
+            filename=file.filename or "unknown_filename", # Provide a default if filename is None
+            model_finding=finding,
+            kcc_references=references,
+            source=("model" if gemini_failed else "model+gemini") if finding else "gemini",
         )
 
     except UnidentifiedImageError:
@@ -136,3 +174,27 @@ async def detect_crop_disease(
             status_code=500, # Internal Server Error
             detail="An internal server error occurred while analyzing the image. Please try again later."
         )
+
+def _model_only_analysis(finding: dict) -> str:
+    """Plain-text result when only the trained classifier is available."""
+    lines = [f"Likely: {finding['disease']} on {finding['crop']} ({finding['confidence']:.0%} probability)."]
+    if not finding["confident"]:
+        lines.append("The model isn't confident about this photo - try a clearer, close-up photo of one "
+                     "affected leaf in daylight.")
+    others = [f"{t['disease']} ({t['probability']:.0%})" for t in finding["top_predictions"][1:]]
+    if others:
+        lines.append("Other possibilities: " + ", ".join(others) + ".")
+    lines.append("Detailed treatment advice is temporarily unavailable - see the Kisan Call Centre expert "
+                 "answers below if shown. Confirm the diagnosis and treatment with your local Krishi Vigyan "
+                 "Kendra or agriculture officer before spraying.")
+    return "\n".join(lines)
+
+
+def _identification(analysis: str):
+    """The disease named on Gemini's 'IDENTIFICATION: ...' first line, if any."""
+    for line in analysis.splitlines()[:5]:
+        cleaned = line.strip().strip("*#").strip()
+        if cleaned.upper().startswith("IDENTIFICATION:"):
+            name = cleaned.split(":", 1)[1].strip().strip("*").strip()
+            return None if name.lower() in ("healthy", "unclear", "") else name
+    return None

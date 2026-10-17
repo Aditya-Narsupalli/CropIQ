@@ -78,6 +78,28 @@ export const predictYieldApi = async (yieldData) => {
 };
 
 /**
+ * Recalculate a yield prediction for different soil/input values.
+ * Fast (no weather/model calls) - reuses scenario_context from predictYieldApi.
+ * @param {object} body { context, ph, n, p, k, organic_carbon, fertilizer, pesticide, price_per_quintal?, cost_per_ha? }
+ * @param {AbortSignal} [signal] lets the caller cancel a superseded request
+ * @returns {Promise<object>} { yield, estimated_production, yield_low, yield_high, breakdown, economics }
+ */
+/**
+ * Rank crops grown in the field's state and season by expected profit/ha.
+ * @param {object} yieldData same fields as predictYieldApi (crop is ignored)
+ * @returns {Promise<object>} { state, season, district_used, crops: [...], compared, note }
+ */
+export const compareCropsApi = async (yieldData) => {
+  const response = await apiClient.post('/yield/compare-crops', yieldData);
+  return response.data;
+};
+
+export const whatIfYieldApi = async (body, signal) => {
+  const response = await apiClient.post('/yield/what-if', body, { signal });
+  return response.data;
+};
+
+/**
  * Get Market Prices
  * @returns {Promise<object>} Backend response
  */
@@ -120,6 +142,15 @@ export const getMarketSummaryApi = async () => {
  * @param {string} crop Crop name
  * @returns {Promise<object>} Backend response
  */
+/**
+ * Today's biggest price movers and every commodity's price vs MSP.
+ * @returns {Promise<object>} { date, gainers, losers, msp_comparison, below_msp, source }
+ */
+export const getMarketInsightsApi = async () => {
+  const response = await apiClient.get('/market/insights');
+  return response.data;
+};
+
 export const getMarketTrendsApi = async (crop) => {
   try {
     // Real Agmarknet commodity names can contain a literal '/' (e.g.

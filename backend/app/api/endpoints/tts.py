@@ -1,6 +1,5 @@
 from fastapi import APIRouter, Body, HTTPException
 from pydantic import BaseModel
-from google.cloud import texttospeech
 import uuid
 import os
 
@@ -12,6 +11,7 @@ class TTSInput(BaseModel):
 
 @router.post("/tts")
 async def tts(tts_input: TTSInput = Body(...)):
+    from google.cloud import texttospeech  # loaded on use: ~12 MB of RAM
     try:
         client = texttospeech.TextToSpeechClient()
         synthesis_input = texttospeech.SynthesisInput(text=tts_input.text)

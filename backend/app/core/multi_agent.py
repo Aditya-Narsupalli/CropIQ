@@ -4,6 +4,7 @@ This module implements a multi-agent system architecture that coordinates specia
 for crop disease detection, yield prediction, market analysis, and voice interactions.
 """
 import asyncio
+from collections import OrderedDict
 from typing import Dict, List, Any, Optional, Callable, Union
 import logging
 from enum import Enum
@@ -156,15 +157,26 @@ class ModelContextProtocol:
     This allows agents to share a common understanding of the conversation state.
     """
     
+    # Each chat session uses two entries (settings + history). Least-recently
+    # used entries are dropped past this cap, so memory doesn't grow with
+    # every visitor for as long as the server runs. A dropped chat session
+    # is restored from the browser's copy on its next message.
+    MAX_CONTEXTS = 2000
+
     def __init__(self):
-        self.contexts: Dict[str, Any] = {}
-        
+        self.contexts: "OrderedDict[str, Any]" = OrderedDict()
+
     def set_context(self, context_id: str, data: Any):
         """Set context data for a specific ID"""
         self.contexts[context_id] = data
-        
+        self.contexts.move_to_end(context_id)
+        while len(self.contexts) > self.MAX_CONTEXTS:
+            self.contexts.popitem(last=False)
+
     def get_context(self, context_id: str) -> Optional[Any]:
         """Get context data for a specific ID"""
+        if context_id in self.contexts:
+            self.contexts.move_to_end(context_id)
         return self.contexts.get(context_id)
         
     def update_context(self, context_id: str, data: Dict[str, Any]):
